@@ -63,6 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#339](https://github.com/open-flight/openflight/issues/339)).
 - **"Moving the OPS243 from USB to the Pi GPIO UART" is now "Connecting the
   OPS243 to the Pi"**, with a note at the top for builds still on USB.
+- **The Camera tab shows the live view, not only the startup verdict.** The
+  header badge, brightness, contrast and a new clipped-pixel **White** reading
+  now come from the latest frame. Previously a unit that locked "Lighting
+  needed" indoors kept advising "add light" with a fully white view in the sun.
+  When the live view disagrees with the startup result, the tab now says the
+  lighting has changed since startup and that a restart will recalibrate.
 - **Bright camera exposure steps stay within the sensor's gain range.** The
   OV9281 tops out at 15.94× analogue gain, but two dark-scene steps requested
   18× and 20× and were silently clamped, so the controller misjudged how bright

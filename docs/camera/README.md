@@ -213,9 +213,14 @@ entire usable area of a compact sensor crop.
 
 When `--camera-capture` is enabled, the Camera tab keeps the preview visible
 beside an operator-control column. Exposure and analogue gain are selected
-automatically. The tab shows the current shutter, gain, impact-area brightness,
-contrast, motion-blur risk, and whether camera-assisted analysis is eligible.
-There is no manual exposure override in the UI.
+automatically. The tab shows the shutter and gain locked at startup, the
+startup result, motion-blur risk, and whether camera-assisted analysis is
+eligible. The header badge, **Live view**, impact-area brightness, contrast, and
+**White** (clipped percentage) come from the latest frame, so they still change
+after exposure is locked. When the live view no longer matches the startup
+result, for example after booting indoors and carrying the unit into sunlight,
+the tab reports **Lighting has changed since startup** instead of the stale
+startup advice. There is no manual exposure override in the UI.
 
 With the OpenFlight driver and the fixed `320x200` capture mode, **View up** and
 **View down** move the real sensor window in safe 10-pixel steps. Each move

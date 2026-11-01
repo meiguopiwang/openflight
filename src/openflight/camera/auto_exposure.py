@@ -230,6 +230,8 @@ class AutoExposurePolicy:
         self._startup = True
         self._startup_adjustments = 0
         self._rejected_indices: set[int] = set()
+        self._usable_fallback_index: int | None = None
+        self._restoring_usable_fallback = False
         self._locked_decision: AutoExposureDecision | None = None
 
     def _reset_startup_state(self) -> None:
@@ -237,6 +239,8 @@ class AutoExposurePolicy:
         self._startup = True
         self._startup_adjustments = 0
         self._rejected_indices = set()
+        self._usable_fallback_index = None
+        self._restoring_usable_fallback = False
         self._locked_decision: AutoExposureDecision | None = None
 
     def reset(self) -> None:
@@ -272,19 +276,86 @@ class AutoExposurePolicy:
                 motion_blur_risk=risk,
             )
 
+        if observation.status == "good" or (
+            observation.acceptable and self._restoring_usable_fallback
+        ):
+            return self._lock_ready(observation, risk)
         if observation.acceptable:
-            self._startup = False
-            self._startup_adjustments = 0
-            self._locked_decision = AutoExposureDecision(
-                status="ready",
-                analysis_eligible=True,
-                message=observation.message,
-                observation=observation,
-                motion_blur_risk=risk,
-            )
-            return self._locked_decision
+            return self._refine_usable(observation, current_index, risk)
+        if self._usable_fallback_index is not None and not self._restoring_usable_fallback:
+            return self._restore_usable_fallback(observation, current_index)
 
+        # The light changed while returning to a usable step: search normally.
+        self._usable_fallback_index = None
+        self._restoring_usable_fallback = False
         return self._startup_decision(observation, current_index)
+
+    def _lock_ready(
+        self,
+        observation: ExposureObservation,
+        risk: Literal["low", "elevated", "high"],
+    ) -> AutoExposureDecision:
+        self._startup = False
+        self._startup_adjustments = 0
+        self._locked_decision = AutoExposureDecision(
+            status="ready",
+            analysis_eligible=True,
+            message=observation.message,
+            observation=observation,
+            motion_blur_risk=risk,
+        )
+        return self._locked_decision
+
+    def _refine_usable(
+        self,
+        observation: ExposureObservation,
+        current_index: int,
+        risk: Literal["low", "elevated", "high"],
+    ) -> AutoExposureDecision:
+        """Try the suggested neighbor of a "marginal" step before settling for it.
+
+        Remembers this step so a worse neighbor sends the camera straight back.
+        """
+        self._usable_fallback_index = current_index
+        self._rejected_indices.add(current_index)
+        direction = {"brighter": 1, "darker": -1}.get(observation.recommendation, 0)
+        neighbor = current_index + direction
+        if (
+            direction == 0
+            or not 0 <= neighbor < len(self.steps)
+            or neighbor in self._rejected_indices
+            or self._startup_adjustments >= self.startup_max_adjustments
+        ):
+            return self._lock_ready(observation, risk)
+
+        self._startup_adjustments += 1
+        target = self.steps[neighbor]
+        return AutoExposureDecision(
+            status="adjusting",
+            analysis_eligible=False,
+            message="Fine-tuning camera exposure",
+            observation=observation,
+            target=target,
+            motion_blur_risk=motion_blur_risk(target.exposure_us),
+        )
+
+    def _restore_usable_fallback(
+        self,
+        observation: ExposureObservation,
+        current_index: int,
+    ) -> AutoExposureDecision:
+        """Return to the last usable step after a neighbor turned out worse."""
+        self._rejected_indices.add(current_index)
+        self._restoring_usable_fallback = True
+        target = self.steps[self._usable_fallback_index]
+        return AutoExposureDecision(
+            status="adjusting",
+            analysis_eligible=False,
+            message="Returning to the best usable camera exposure",
+            observation=observation,
+            target=target,
+            motion_blur_risk=motion_blur_risk(target.exposure_us),
+        )
 
     def _startup_decision(
         self,

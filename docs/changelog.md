@@ -63,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#339](https://github.com/open-flight/openflight/issues/339)).
 - **"Moving the OPS243 from USB to the Pi GPIO UART" is now "Connecting the
   OPS243 to the Pi"**, with a note at the top for builds still on USB.
+- **Camera exposure prefers "good" over the first "usable" setting.** Startup
+  and recalibration used to lock the first marginal step, even when it
+  suggested a better neighbor (a recalibration locked 500 µs × 15 at p90 98,
+  two short of "good", without trying 650 µs × 15). The controller now tries
+  that neighbor and returns to the usable step only if the neighbor is worse.
 - **The Camera tab shows the live view, not only the startup verdict.** The
   header badge, brightness, contrast and a new clipped-pixel **White** reading
   now come from the latest frame. Previously a unit that locked "Lighting

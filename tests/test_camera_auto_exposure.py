@@ -317,6 +317,112 @@ def test_startup_overshoot_tries_the_untried_step_in_between():
     assert ready.status == "ready"
 
 
+def _run_policy(policy, start, rate):
+    """Drive the policy until it locks; ``rate(step)`` returns each observation."""
+    exposure_us, gain = start
+    visited = [start]
+    decision = policy.evaluate(rate((exposure_us, gain)), exposure_us=exposure_us, gain=gain)
+    while decision.should_apply:
+        exposure_us, gain = decision.target.exposure_us, decision.target.gain
+        visited.append((exposure_us, gain))
+        decision = policy.evaluate(rate((exposure_us, gain)), exposure_us=exposure_us, gain=gain)
+    return decision, visited
+
+
+def test_usable_setting_tries_the_suggested_neighbor_and_locks_good():
+    """Replay the 2026-11-01 recalibration that stopped at "usable".
+
+    500us x15 measured median 61 / p90 98 (two short of "good") and suggested
+    a brighter setting, but the policy locked without trying 650us x15.
+    """
+    policy = AutoExposurePolicy(fps=450.0)
+    ratings = {
+        (500, 15.0): observation("marginal", "brighter", median=61.0, p90=98.0),
+        (650, 15.0): observation("good", "hold", median=80.0, p90=128.0),
+    }
+
+    decision, visited = _run_policy(policy, (500, 15.0), ratings.__getitem__)
+
+    assert visited == [(500, 15.0), (650, 15.0)]
+    assert decision.status == "ready"
+    assert decision.observation.status == "good"
+
+
+def test_usable_setting_keeps_moving_while_neighbors_stay_usable():
+    policy = AutoExposurePolicy(fps=450.0)
+    ratings = {
+        (500, 12.0): observation("marginal", "brighter", median=50.0, p90=90.0),
+        (500, 15.0): observation("marginal", "brighter", median=58.0, p90=96.0),
+        (650, 15.0): observation("good", "hold", median=80.0, p90=128.0),
+    }
+
+    decision, visited = _run_policy(policy, (500, 12.0), ratings.__getitem__)
+
+    assert visited == [(500, 12.0), (500, 15.0), (650, 15.0)]
+    assert decision.observation.status == "good"
+
+
+def test_usable_setting_is_restored_when_the_neighbor_is_worse():
+    policy = AutoExposurePolicy(fps=450.0)
+    ratings = {
+        (500, 15.0): observation("marginal", "brighter", median=170.0, p90=200.0),
+        (650, 15.0): observation("too_bright", "darker", median=230.0, p90=255.0),
+    }
+
+    decision, visited = _run_policy(policy, (500, 15.0), ratings.__getitem__)
+
+    assert visited == [(500, 15.0), (650, 15.0), (500, 15.0)]
+    assert decision.status == "ready"
+    assert decision.analysis_eligible is True
+    assert decision.observation.status == "marginal"
+
+
+def test_usable_setting_locks_when_the_neighbor_points_back():
+    """Two usable neighbors recommending each other must not ping-pong."""
+    policy = AutoExposurePolicy(fps=450.0)
+    ratings = {
+        (500, 15.0): observation("marginal", "brighter", median=60.0, p90=97.0),
+        (650, 15.0): observation("marginal", "darker", median=185.0, p90=210.0),
+    }
+
+    decision, visited = _run_policy(policy, (500, 15.0), ratings.__getitem__)
+
+    assert visited == [(500, 15.0), (650, 15.0)]
+    assert decision.status == "ready"
+    assert decision.observation.status == "marginal"
+
+
+def test_usable_setting_at_the_end_of_the_ladder_locks_immediately():
+    policy = AutoExposurePolicy(fps=450.0)
+    darkest = EXPOSURE_STEPS[0]
+
+    decision = policy.evaluate(
+        observation("marginal", "darker", median=190.0, p90=230.0),
+        exposure_us=darkest.exposure_us,
+        gain=darkest.gain,
+    )
+
+    assert decision.status == "ready"
+    assert not decision.should_apply
+
+
+def test_restored_usable_setting_that_is_no_longer_usable_keeps_searching():
+    """If the light changes during fine-tuning, fall back to normal stepping."""
+    policy = AutoExposurePolicy(fps=450.0)
+    ratings = iter(
+        [
+            observation("marginal", "brighter", median=170.0, p90=200.0),  # 500 x15
+            observation("too_bright", "darker", median=230.0, p90=255.0),  # 650 x15
+            observation("too_dark", "brighter", median=20.0, p90=40.0),  # back at 500 x15
+        ]
+    )
+
+    decision, visited = _run_policy(policy, (500, 15.0), lambda _step: next(ratings, None))
+
+    assert visited[:3] == [(500, 15.0), (650, 15.0), (500, 15.0)]
+    assert decision.status == "lighting_required"
+
+
 def test_default_startup_budget_can_walk_the_whole_ladder():
     policy = AutoExposurePolicy(fps=450.0)
 

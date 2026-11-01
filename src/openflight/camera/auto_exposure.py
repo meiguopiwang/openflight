@@ -64,9 +64,11 @@ EXPOSURE_STEPS = (
     ExposureStep(500, 12.0, "Indoor bright"),
     ExposureStep(500, 15.0),
     ExposureStep(650, 15.0, "Indoor dark"),
-    ExposureStep(800, 18.0),
-    ExposureStep(1000, 20.0, "Night"),
-    ExposureStep(1250, 16.0, "Facility dark"),
+    # The OV9281 gain register tops out at 255/16 = 15.94x; higher requests
+    # were silently clamped, so the brightest steps add shutter time instead.
+    ExposureStep(900, 15.9),
+    ExposureStep(1100, 15.9, "Night"),
+    ExposureStep(1250, 15.9, "Facility dark"),
 )
 
 

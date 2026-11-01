@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#339](https://github.com/open-flight/openflight/issues/339)).
 - **"Moving the OPS243 from USB to the Pi GPIO UART" is now "Connecting the
   OPS243 to the Pi"**, with a note at the top for builds still on USB.
+- **Bright camera exposure steps stay within the sensor's gain range.** The
+  OV9281 tops out at 15.94× analogue gain, but two dark-scene steps requested
+  18× and 20× and were silently clamped, so the controller misjudged how bright
+  they were. The brightest steps are now 900, 1100 and 1250 µs at 15.9×.
 - **Darker camera exposure steps for sunlit ranges.** The exposure ladder now
   continues below 100 µs at 2× gain with unity-gain steps from 100 µs down to
   15 µs. On a sunny range the previous darkest step still left about 91% of the

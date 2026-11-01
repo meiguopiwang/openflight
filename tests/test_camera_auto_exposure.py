@@ -67,6 +67,25 @@ def test_ladder_reaches_bright_sun_with_unity_gain():
     assert darkest.exposure_us >= 15
 
 
+def test_ladder_gains_fit_the_sensor_gain_range():
+    """The OV9281 gain register tops out at 255/16 = 15.94x.
+
+    Saved 2026-10-24 captures that requested 1000us x20 recorded 15.94x on
+    every frame, so steps above it were silently clamped and the policy's
+    brightness model no longer matched the image.
+    """
+    sensor_max_gain = 255 / 16
+
+    assert all(1.0 <= step.gain <= sensor_max_gain for step in EXPOSURE_STEPS)
+
+
+def test_ladder_signal_stays_strictly_increasing():
+    """Equal-brightness steps (e.g. 1000us x20 vs 1250us x16) waste a check."""
+    signals = [step.signal for step in EXPOSURE_STEPS]
+
+    assert all(lower < upper for lower, upper in zip(signals, signals[1:]))
+
+
 def test_ladder_steps_are_distinct_after_sensor_row_rounding():
     """Exposure is applied in whole sensor rows, so steps must not collapse."""
     row_us = (320 + 1136) / 200.0  # 320x200 line length / 200 MHz pixel rate

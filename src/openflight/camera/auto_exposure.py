@@ -204,20 +204,27 @@ class AutoExposurePolicy:
         self,
         *,
         fps: float,
-        startup_max_adjustments: int = 3,
+        startup_max_adjustments: int | None = None,
     ):
+        self.steps = exposure_steps_for_fps(fps)
+        # By default startup may visit every step once: a saved seed from a
+        # different lighting environment can sit at the opposite end of the
+        # ladder, and partly clipped scenes move only one step per check.
+        if startup_max_adjustments is None:
+            startup_max_adjustments = max(1, len(self.steps) - 1)
         if startup_max_adjustments < 1:
             raise ValueError("startup_max_adjustments must be positive")
-        self.steps = exposure_steps_for_fps(fps)
         self.startup_max_adjustments = startup_max_adjustments
         self._startup = True
         self._startup_adjustments = 0
+        self._rejected_indices: set[int] = set()
         self._locked_decision: AutoExposureDecision | None = None
 
     def _reset_startup_state(self) -> None:
         """Enter startup convergence and clear any prior locked result."""
         self._startup = True
         self._startup_adjustments = 0
+        self._rejected_indices = set()
         self._locked_decision: AutoExposureDecision | None = None
 
     def reset(self) -> None:
@@ -285,6 +292,7 @@ class AutoExposurePolicy:
             )
             return self._locked_decision
 
+        self._rejected_indices.add(current_index)
         target_index = self._startup_target_index(observation, current_index)
         if target_index == current_index:
             self._startup = False
@@ -323,14 +331,25 @@ class AutoExposurePolicy:
             range(len(self.steps)),
             key=lambda index: abs(math.log(self.steps[index].signal / target_signal)),
         )
+        # Only move into steps strictly between the current step and the
+        # nearest already-rejected step in that direction, so an overshoot
+        # narrows the search instead of bouncing between two failed steps.
         if observation.recommendation == "brighter":
-            return (
-                max(current_index + 1, target_index)
-                if current_index < len(self.steps) - 1
-                else current_index
+            ceiling = min(
+                (index for index in self._rejected_indices if index > current_index),
+                default=len(self.steps),
             )
+            if current_index + 1 >= ceiling:
+                return current_index
+            return min(max(current_index + 1, target_index), ceiling - 1)
         if observation.recommendation == "darker":
-            return min(current_index - 1, target_index) if current_index > 0 else current_index
+            floor = max(
+                (index for index in self._rejected_indices if index < current_index),
+                default=-1,
+            )
+            if current_index - 1 <= floor:
+                return current_index
+            return max(min(current_index - 1, target_index), floor + 1)
         return current_index
 
     def _nearest_step_index(self, exposure_us: int, gain: float) -> int:

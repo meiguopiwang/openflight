@@ -163,6 +163,111 @@ def test_ladder_limit_stays_locked_until_the_next_startup():
     assert recovered.analysis_eligible is True
 
 
+def test_partly_clipped_sunny_startup_keeps_stepping_darker_while_steps_remain():
+    """Replay the 2026-11-01 outdoor boot that locked with darker steps untried.
+
+    Starting from the saved "Evening" seed, a sunlit view with a mid-grey
+    median but ~17% clipped pixels only moves one step per check. The policy
+    must not give up while darker validated steps are still available.
+    """
+    policy = AutoExposurePolicy(fps=450.0)
+    sunny = observation("too_bright", "darker", median=96.0, p90=255.0)
+    exposure_us, gain = 450, 10.0
+    visited = [(exposure_us, gain)]
+
+    decision = policy.evaluate(sunny, exposure_us=exposure_us, gain=gain)
+    while decision.should_apply:
+        exposure_us, gain = decision.target.exposure_us, decision.target.gain
+        visited.append((exposure_us, gain))
+        decision = policy.evaluate(sunny, exposure_us=exposure_us, gain=gain)
+
+    darkest = EXPOSURE_STEPS[0]
+    assert visited[-1] == (darkest.exposure_us, darkest.gain)
+    assert decision.status == "lighting_required"
+    assert "overexposed" in decision.message
+
+
+def test_startup_settles_on_the_first_acceptable_step_after_several_adjustments():
+    policy = AutoExposurePolicy(fps=450.0)
+    sunny = observation("too_bright", "darker", median=96.0, p90=255.0)
+    exposure_us, gain = 450, 10.0
+    for _ in range(4):
+        decision = policy.evaluate(sunny, exposure_us=exposure_us, gain=gain)
+        assert decision.status == "adjusting"
+        exposure_us, gain = decision.target.exposure_us, decision.target.gain
+
+    ready = policy.evaluate(
+        observation("good", "hold", median=100.0),
+        exposure_us=exposure_us,
+        gain=gain,
+    )
+
+    assert ready.status == "ready"
+    assert ready.analysis_eligible is True
+
+
+def test_startup_never_returns_to_a_step_it_already_rejected():
+    """Overshooting past a too-bright step must not bounce back to it forever."""
+    policy = AutoExposurePolicy(fps=450.0)
+    too_bright = policy.evaluate(
+        observation("too_bright", "darker", median=200.0, p90=255.0),
+        exposure_us=350,
+        gain=6.0,
+    )
+    darker = too_bright.target
+
+    failed = policy.evaluate(
+        observation("too_dark", "brighter", median=30.0, p90=60.0),
+        exposure_us=darker.exposure_us,
+        gain=darker.gain,
+    )
+    seen = {(350, 6.0), (darker.exposure_us, darker.gain)}
+    while failed.should_apply:
+        target = (failed.target.exposure_us, failed.target.gain)
+        assert target not in seen
+        seen.add(target)
+        failed = policy.evaluate(
+            observation("too_bright", "darker", median=200.0, p90=255.0)
+            if target[0] * target[1] >= 350 * 6.0
+            else observation("too_dark", "brighter", median=30.0, p90=60.0),
+            exposure_us=target[0],
+            gain=target[1],
+        )
+
+    assert failed.status == "lighting_required"
+    assert failed.analysis_eligible is False
+
+
+def test_startup_overshoot_tries_the_untried_step_in_between():
+    policy = AutoExposurePolicy(fps=450.0)
+    darker = policy.evaluate(
+        observation("too_bright", "darker", median=200.0, p90=255.0),
+        exposure_us=350,
+        gain=6.0,
+    ).target
+    assert (darker.exposure_us, darker.gain) == (250, 4.0)
+
+    between = policy.evaluate(
+        observation("too_dark", "brighter", median=30.0, p90=60.0),
+        exposure_us=darker.exposure_us,
+        gain=darker.gain,
+    ).target
+    ready = policy.evaluate(
+        observation("good", "hold", median=100.0),
+        exposure_us=between.exposure_us,
+        gain=between.gain,
+    )
+
+    assert (between.exposure_us, between.gain) == (300, 5.0)
+    assert ready.status == "ready"
+
+
+def test_default_startup_budget_can_walk_the_whole_ladder():
+    policy = AutoExposurePolicy(fps=450.0)
+
+    assert policy.startup_max_adjustments == len(policy.steps) - 1
+
+
 def test_startup_attempt_limit_requires_lighting_change():
     policy = AutoExposurePolicy(fps=488.0, startup_max_adjustments=1)
     dark = observation("too_dark", "brighter", median=18.0, p90=40.0)

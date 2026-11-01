@@ -63,6 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#339](https://github.com/open-flight/openflight/issues/339)).
 - **"Moving the OPS243 from USB to the Pi GPIO UART" is now "Connecting the
   OPS243 to the Pi"**, with a note at the top for builds still on USB.
+- **Camera startup exposure no longer gives up after three adjustments.**
+  Booting in sunlight from a setting saved indoors or in the evening could lock
+  on "Lighting needed" with darker validated steps never tried, because a partly
+  clipped view moves only one step per check. Startup now keeps stepping while
+  untried steps remain in the needed direction and never revisits a rejected
+  step, so it settles on a usable setting or reaches the end of the ladder.
 - **The OPS sound-trigger hardware test defaults to the Pi GPIO UART.**
   `scripts/hardware-test/test_sound_trigger.py` now uses `/dev/ttyAMA0`
   when `--port` is omitted. For USB, pass the device explicitly, for example

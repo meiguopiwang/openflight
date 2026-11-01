@@ -9,6 +9,7 @@ describe('CameraPanel', () => {
         captureSettings={{ available: true, running: true, armed: true, width: 320, height: 200, fps: 600 }}
         captureSettingsError={null}
         onUpdateCaptureSettings={() => {}}
+        onRecalibrateExposure={() => {}}
       />
     );
 

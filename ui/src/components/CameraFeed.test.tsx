@@ -58,7 +58,7 @@ describe('CameraFeed', () => {
     expect(html).toContain('camera-feed__workspace');
     expect(html).toContain('Camera setup');
     expect(html).toContain('Automatic exposure');
-    expect(html).toContain('calibrates once at startup');
+    expect(html).toContain('calibrates at startup or on request');
     expect(html).not.toContain('checks every 5 seconds');
     expect(html).toContain('Live view');
     expect(html).toContain('camera-feed__exposure-quality');
@@ -80,6 +80,7 @@ describe('CameraFeed', () => {
     expect(html).toContain('320 × 200');
     expect(html).toContain('600 fps');
     expect(html).toContain('Armed');
+    expect(html).not.toContain('Recalibrate exposure');
   });
 
   it('shows the live view, not the startup verdict, after lighting changes', () => {
@@ -107,13 +108,15 @@ describe('CameraFeed', () => {
         }}
         error={null}
         onUpdate={vi.fn()}
+        onRecalibrate={vi.fn()}
       />
     );
 
     expect(html).toContain('Lighting needed');
     expect(html).toContain('Too bright');
     expect(html).toContain('Lighting has changed since startup');
-    expect(html).toContain('restart OpenFlight to recalibrate');
+    expect(html).toContain('tap Recalibrate exposure');
+    expect(html).toContain('>Recalibrate exposure</button>');
     expect(html).not.toContain('add or redirect light toward the ball');
     expect(html).toContain('255');
     expect(html).toContain('100<!-- -->%');
@@ -141,12 +144,35 @@ describe('CameraFeed', () => {
         }}
         error={null}
         onUpdate={vi.fn()}
+        onRecalibrate={vi.fn()}
       />
     );
 
     expect(html).toContain('add or redirect light toward the ball');
     expect(html).not.toContain('Lighting has changed since startup');
     expect(html).toContain('59');
+    expect(html).toContain('>Recalibrate exposure</button>');
+  });
+
+  it('disables the recalibrate button right after it is tapped', () => {
+    const lockedDark = {
+      ...captureSettings.auto_exposure!,
+      status: 'lighting_required' as const,
+      analysis_eligible: false,
+      observation: { sample_available: true, status: 'too_dark' as const },
+    };
+    const html = renderToString(
+      <CaptureSettingsPanel
+        settings={{ ...captureSettings, auto_exposure: lockedDark }}
+        exposureQuality={{ sample_available: true, status: 'too_bright', auto_exposure: lockedDark }}
+        error={null}
+        onUpdate={vi.fn()}
+        onRecalibrate={vi.fn()}
+        recalibrationPending
+      />
+    );
+
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Recalibrating…<\/button>/);
   });
 
   it('explains lighting failure without disabling capture', () => {

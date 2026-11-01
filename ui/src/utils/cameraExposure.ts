@@ -33,5 +33,14 @@ export function lightingChangeMessage(liveStatus: CameraExposureObservationStatu
       : liveStatus === 'too_dark'
         ? 'The view is too dark now'
         : 'Lighting looks usable now';
-  return `${now}; restart OpenFlight to recalibrate.`;
+  return `${now}; tap Recalibrate exposure.`;
+}
+
+/** Offer recalibration when the locked verdict is stale or asked for more light. */
+export function shouldOfferRecalibration(
+  startup: CameraAutoExposureStatus | undefined,
+  liveStatus: CameraExposureObservationStatus | undefined
+): boolean {
+  if (!startup?.enabled) return false;
+  return startup.status === 'lighting_required' || lightingChangedSinceStartup(startup, liveStatus);
 }

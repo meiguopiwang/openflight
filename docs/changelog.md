@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the Geekworm X1202/X1206 question now also asks whether to install
   `openflight-battery-guard.service` (default yes). A failed Geekworm step,
   such as the taskbar package, warns instead of ending the setup run.
+- **Recalibrate camera exposure without restarting.** The Camera tab offers
+  **Recalibrate exposure** when startup reported "Lighting needed" or the live
+  view no longer matches the startup result. It reruns automatic exposure in the
+  background (socket event `recalibrate_camera_exposure`) while the rolling
+  buffer and radars keep running; shots during recalibration fall back to radar
+  for camera-derived metrics. See
+  [Automatic Exposure](camera/README.md#automatic-exposure).
 - **Optional low-battery shutdown for UPS builds.**
   `scripts/battery/install_battery_guard.sh` installs a systemd service that,
   when external power is offline and the battery is at or below 10% or 3.40 V

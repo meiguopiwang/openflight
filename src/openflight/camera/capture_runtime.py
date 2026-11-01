@@ -40,6 +40,8 @@ CameraCaptureStream = Literal["raw", "main-y"]
 RASPBERRY_PI_DIST_PACKAGES = Path("/usr/lib/python3/dist-packages")
 OV9281_VERTICAL_OFFSET_PATH = Path("/sys/module/ov9282/parameters/strip_y_offset")
 AUTO_EXPOSURE_STARTUP_SETTLE_S = 0.3
+# libcamera applies new controls a few frames after set_controls returns.
+RECALIBRATION_CONTROL_LATENCY_S = 0.05
 
 
 def vertical_crop_limits(width: int, height: int) -> dict[str, int] | None:
@@ -189,6 +191,7 @@ class CameraCaptureRuntime:
         self._auto_exposure_last_check_epoch: float | None = None
         self._auto_exposure_last_adjustment_epoch: float | None = None
         self._auto_exposure_capture_deferred = False
+        self._recalibration_thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Start the camera and, optionally, the GPIO edge listener."""
@@ -541,6 +544,79 @@ class CameraCaptureRuntime:
         )
         self._wait_for_prebuffer()
 
+    def request_exposure_recalibration(self) -> None:
+        """Re-run exposure calibration in the background without stopping capture.
+
+        The rolling buffer and trigger stay armed. Shots during recalibration
+        are still recorded, but camera-derived metrics are withheld until the
+        pre-trigger ring has refilled at the newly locked setting.
+        """
+        if not self.settings.auto_exposure:
+            raise RuntimeError("automatic exposure is disabled")
+        if not self._running or self._camera is None:
+            raise RuntimeError("camera capture is not running")
+        # Shared with sensor-window moves, which stop and restart the camera.
+        # The recalibration thread releases it, so a `with` block cannot.
+        if not self._reconfigure_lock.acquire(  # pylint: disable=consider-using-with
+            blocking=False
+        ):
+            raise RuntimeError("camera is already recalibrating or restarting")
+        try:
+            self._auto_exposure_policy.reset()
+            self._auto_exposure_stop.clear()
+            self._withhold_camera_analysis("Recalibrating camera exposure")
+            self._recalibration_thread = threading.Thread(
+                target=self._recalibrate_exposure,
+                name="camera-exposure-recalibrate",
+                daemon=True,
+            )
+            self._recalibration_thread.start()
+        except Exception:
+            self._reconfigure_lock.release()
+            raise
+        logger.info("[CAMERA] Exposure recalibration requested")
+
+    def _recalibrate_exposure(self) -> None:
+        """Converge to a new locked setting, then wait for a clean pre-trigger ring."""
+        try:
+            self._auto_exposure_loop()
+            with self._auto_exposure_lock:
+                locked = self._auto_exposure_decision
+            if not locked.analysis_eligible:
+                return
+            self._withhold_camera_analysis(
+                "Refilling the pre-trigger buffer at the new camera exposure"
+            )
+            if self._wait_for_recalibrated_prebuffer():
+                with self._auto_exposure_lock:
+                    self._auto_exposure_decision = locked
+                logger.info(
+                    "[CAMERA] Recalibrated exposure armed: %dus gain %.1f",
+                    self.settings.exposure_us,
+                    self.settings.gain,
+                )
+        finally:
+            self._reconfigure_lock.release()
+
+    def _withhold_camera_analysis(self, message: str) -> None:
+        """Report recalibration progress and keep camera metrics out of shots."""
+        with self._auto_exposure_lock:
+            self._auto_exposure_decision = replace(
+                self._auto_exposure_decision,
+                status="adjusting",
+                analysis_eligible=False,
+                message=message,
+                target=None,
+            )
+
+    def _wait_for_recalibrated_prebuffer(self) -> bool:
+        """Wait until every pre-trigger frame was exposed at the locked setting.
+
+        Returns False if the runtime stopped while waiting.
+        """
+        refill_s = self.settings.pre_ms / 1000.0 + RECALIBRATION_CONTROL_LATENCY_S
+        return not self._auto_exposure_stop.wait(refill_s)
+
     def _start_auto_exposure(self) -> None:
         """Calibrate once before arming shot capture, then lock the controls."""
         self._auto_exposure_policy.reset()
@@ -553,7 +629,7 @@ class CameraCaptureRuntime:
             try:
                 decision = self._run_auto_exposure_cycle()
             except Exception:  # pylint: disable=broad-exception-caught
-                logger.warning("[CAMERA] Startup exposure calibration failed", exc_info=True)
+                logger.warning("[CAMERA] Exposure calibration failed", exc_info=True)
                 return
 
             if decision is None:
@@ -562,7 +638,7 @@ class CameraCaptureRuntime:
                 continue
             if not decision.should_apply:
                 logger.info(
-                    "[CAMERA] Startup exposure locked: %dus gain %.1f (%s)",
+                    "[CAMERA] Exposure locked: %dus gain %.1f (%s)",
                     self.settings.exposure_us,
                     self.settings.gain,
                     decision.status,

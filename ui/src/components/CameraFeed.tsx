@@ -1,7 +1,12 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useCameraPointerDragScroll } from '../hooks/useCameraPointerDragScroll';
 import type { CameraAutoExposureStatus, CameraCaptureSettings, CameraExposureQuality } from '../stores/useCameraStore';
-import { LIVE_EXPOSURE_LABELS, lightingChangeMessage, lightingChangedSinceStartup } from '../utils/cameraExposure';
+import {
+  LIVE_EXPOSURE_LABELS,
+  lightingChangeMessage,
+  lightingChangedSinceStartup,
+  shouldOfferRecalibration,
+} from '../utils/cameraExposure';
 import { verticalViewTargets } from '../utils/cameraView';
 import { getServerOrigin } from '../utils/serverOrigin';
 import './CameraFeed.css';
@@ -10,6 +15,7 @@ interface CameraFeedProps {
   captureSettings: CameraCaptureSettings;
   captureSettingsError: string | null;
   onUpdateCaptureSettings: (settings: Partial<CameraCaptureSettings>) => void;
+  onRecalibrateExposure?: () => void;
 }
 
 interface CaptureSettingsPanelProps {
@@ -17,11 +23,16 @@ interface CaptureSettingsPanelProps {
   exposureQuality: CameraExposureQuality | null;
   error: string | null;
   onUpdate: (settings: Partial<CameraCaptureSettings>) => void;
+  onRecalibrate?: () => void;
+  /** True between a tap and the next status poll, so one tap sends one request. */
+  recalibrationPending?: boolean;
 }
 
 const PREVIEW_URL = `${getServerOrigin()}/api/camera/preview.jpg`;
 const EXPOSURE_QUALITY_URL = `${getServerOrigin()}/api/camera/exposure-quality`;
 const PREVIEW_REFRESH_MS = 5000;
+// Re-poll soon after a recalibration tap so the panel shows "Adjusting" promptly.
+const RECALIBRATION_STATUS_REFRESH_MS = 300;
 const BALL_GUIDE_X_PCT = 50;
 const BALL_GUIDE_Y_PCT = 78;
 
@@ -34,7 +45,14 @@ const AUTO_EXPOSURE_LABELS: Record<CameraAutoExposureStatus['status'], string> =
   unavailable: 'Waiting',
 };
 
-export function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: CaptureSettingsPanelProps) {
+export function CaptureSettingsPanel({
+  settings,
+  exposureQuality,
+  error,
+  onUpdate,
+  onRecalibrate,
+  recalibrationPending = false,
+}: CaptureSettingsPanelProps) {
   const verticalOffset = settings.vertical_offset_px ?? 0;
   const verticalMin = settings.vertical_offset_min_px ?? verticalOffset;
   const verticalMax = settings.vertical_offset_max_px ?? verticalOffset;
@@ -54,6 +72,7 @@ export function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdat
     lightingChanged && liveStatus
       ? `Lighting has changed since startup. ${lightingChangeMessage(liveStatus)}`
       : (autoExposure?.message ?? 'Waiting for the first camera check');
+  const offerRecalibration = onRecalibrate !== undefined && shouldOfferRecalibration(autoExposure, liveStatus);
 
   return (
     <aside className="camera-settings">
@@ -98,7 +117,7 @@ export function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdat
         <section className="camera-settings__section">
           <div className="camera-settings__section-title">
             <span>Automatic exposure</span>
-            <small>calibrates once at startup</small>
+            <small>calibrates at startup or on request</small>
           </div>
           <div
             className={`camera-settings__auto-status camera-settings__auto-status--${autoExposure?.status ?? 'unavailable'}`}
@@ -109,6 +128,16 @@ export function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdat
             </div>
             <span className="camera-settings__auto-dot" aria-hidden="true" />
           </div>
+          {offerRecalibration && (
+            <button
+              type="button"
+              className="camera-settings__recalibrate"
+              disabled={recalibrationPending}
+              onClick={onRecalibrate}
+            >
+              {recalibrationPending ? 'Recalibrating…' : 'Recalibrate exposure'}
+            </button>
+          )}
           <dl className="camera-settings__exposure-metrics">
             <div>
               <dt>Shutter</dt>
@@ -209,12 +238,19 @@ export function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdat
  * still refreshed every 5 s from the concurrent preview stream. The raw
  * rolling buffer keeps running, so shots are never missed while viewing.
  */
-export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCaptureSettings }: CameraFeedProps) {
+export function CameraFeed({
+  captureSettings,
+  captureSettingsError,
+  onUpdateCaptureSettings,
+  onRecalibrateExposure,
+}: CameraFeedProps) {
   useCameraPointerDragScroll();
   const [previewState, setPreviewState] = useState<PreviewState>('checking');
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [exposureQuality, setExposureQuality] = useState<CameraExposureQuality | null>(null);
+  const [recalibrationPending, setRecalibrationPending] = useState(false);
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
   const crosshairStyle = {
     '--camera-crosshair-x': `${BALL_GUIDE_X_PCT}%`,
     '--camera-crosshair-y': `${BALL_GUIDE_Y_PCT}%`,
@@ -246,20 +282,31 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
         const qualityResponse = await fetch(`${EXPOSURE_QUALITY_URL}?t=${Date.now()}`, { cache: 'no-store' });
         if (qualityResponse.ok && !cancelled) {
           setExposureQuality(await qualityResponse.json());
+          setRecalibrationPending(false);
         }
       } catch {
         // Keep the last frame and retry after a transient network failure.
       }
     };
 
+    refreshRef.current = refresh;
     refresh();
     timer = setInterval(refresh, PREVIEW_REFRESH_MS);
     return () => {
       cancelled = true;
+      refreshRef.current = null;
       if (timer) clearInterval(timer);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, []);
+
+  const recalibrate = onRecalibrateExposure
+    ? () => {
+        setRecalibrationPending(true);
+        onRecalibrateExposure();
+        setTimeout(() => refreshRef.current?.(), RECALIBRATION_STATUS_REFRESH_MS);
+      }
+    : undefined;
 
   if (previewState === 'available' || previewState === 'checking') {
     return (
@@ -324,6 +371,8 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
             exposureQuality={exposureQuality}
             error={captureSettingsError}
             onUpdate={onUpdateCaptureSettings}
+            onRecalibrate={recalibrate}
+            recalibrationPending={recalibrationPending}
           />
         </div>
       </div>

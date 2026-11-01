@@ -220,7 +220,9 @@ eligible. The header badge, **Live view**, impact-area brightness, contrast, and
 after exposure is locked. When the live view no longer matches the startup
 result, for example after booting indoors and carrying the unit into sunlight,
 the tab reports **Lighting has changed since startup** instead of the stale
-startup advice. There is no manual exposure override in the UI.
+startup advice and offers **Recalibrate exposure**. The same button appears
+whenever startup reported **Lighting needed**. There is no manual exposure
+override in the UI.
 
 With the OpenFlight driver and the fixed `320x200` capture mode, **View up** and
 **View down** move the real sensor window in safe 10-pixel steps. Each move
@@ -252,10 +254,9 @@ gain for sunlit ranges, where 100 µs at 2× gain still clipped most of the
 impact area. A step rated usable but not good is not accepted straight away:
 the controller tries the neighboring step the measurement suggests, keeps it if
 it rates good (or usable in the same direction), and otherwise returns to the
-usable step. The selected manual exposure and gain are
-then locked for the
-life of that camera runtime, so every replay in the session uses the same image
-controls. There is no periodic exposure monitoring after startup.
+usable step. The selected manual exposure and gain are then locked until the
+next startup or until the operator taps **Recalibrate exposure**. There is no
+periodic exposure monitoring.
 
 The last good setting is stored at:
 
@@ -268,8 +269,17 @@ stop the camera. Preview and raw frame capture continue, but camera-assisted
 horizontal launch, Club Path, and Attack Angle are withheld for that shot.
 Horizontal launch falls back to the IWR6843 path. The Camera tab reports
 **Lighting needed** and **Radar fallback active** so the operator can add or
-redirect light. Restart OpenFlight after changing the lighting so startup
-calibration can select and lock a new setting.
+redirect light.
+
+After changing the lighting, tap **Recalibrate exposure** on the Camera tab
+instead of restarting OpenFlight. It reruns the same calibration in the
+background, typically within a few seconds, without stopping the camera or the
+radars. The sound trigger stays armed: a shot during recalibration still
+records a clip, but camera-derived metrics fall back to radar for that shot.
+After the new setting locks, camera analysis stays withheld for one
+pre-trigger window (`--camera-capture-pre-ms` plus about 50 ms) so no clip
+mixes frames from the old and new settings. Recalibration is refused while a
+**View up**/**View down** sensor move is restarting the camera.
 
 The standalone calibration sweep remains useful when diagnosing an unusual
 lighting installation:

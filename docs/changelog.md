@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#339](https://github.com/open-flight/openflight/issues/339)).
 - **"Moving the OPS243 from USB to the Pi GPIO UART" is now "Connecting the
   OPS243 to the Pi"**, with a note at the top for builds still on USB.
+- **Darker camera exposure steps for sunlit ranges.** The exposure ladder now
+  continues below 100 µs at 2× gain with unity-gain steps from 100 µs down to
+  15 µs. On a sunny range the previous darkest step still left about 91% of the
+  impact area white, so the camera locked on "overexposed" for the session.
 - **Camera startup exposure no longer gives up after three adjustments.**
   Booting in sunlight from a setting saved indoors or in the evening could lock
   on "Lighting needed" with darker validated steps never tried, because a partly

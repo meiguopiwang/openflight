@@ -39,6 +39,42 @@ def test_exposure_ladder_is_monotonic_and_respects_frame_period():
         exposure_steps_for_fps(0)
 
 
+def test_fully_clipped_view_at_100us_x2_can_still_step_darker():
+    """Replay the 2026-10-18 range session: 100us x2 left ~91% of pixels white.
+
+    That was the darkest validated step, so the policy locked on "overexposed"
+    for 99 shots. Sunlit ranges need steps below it.
+    """
+    policy = AutoExposurePolicy(fps=450.0)
+
+    decision = policy.evaluate(
+        observation("too_bright", "darker", median=255.0, p90=255.0),
+        exposure_us=100,
+        gain=2.0,
+    )
+
+    assert decision.status == "adjusting"
+    assert decision.target.signal < 100 * 2.0
+
+
+def test_ladder_reaches_bright_sun_with_unity_gain():
+    darkest = EXPOSURE_STEPS[0]
+
+    # At least 8x darker than the old 100us x2 floor, without any analogue
+    # boost, and still at least two sensor rows (~7.3us each at 320x200).
+    assert darkest.signal <= (100 * 2.0) / 8
+    assert darkest.gain == 1.0
+    assert darkest.exposure_us >= 15
+
+
+def test_ladder_steps_are_distinct_after_sensor_row_rounding():
+    """Exposure is applied in whole sensor rows, so steps must not collapse."""
+    row_us = (320 + 1136) / 200.0  # 320x200 line length / 200 MHz pixel rate
+    rows = [(int(step.exposure_us // row_us), step.gain) for step in EXPOSURE_STEPS]
+
+    assert len(set(rows)) == len(rows)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(18, "too_dark"), (110, "good"), (252, "too_bright")],
@@ -75,7 +111,7 @@ def test_startup_dark_scene_jumps_more_than_one_step():
 
     assert decision.status == "adjusting"
     assert decision.target is not None
-    assert decision.target.signal > EXPOSURE_STEPS[4].signal
+    assert decision.target.signal > 300 * 5.0
     assert decision.analysis_eligible is False
 
 

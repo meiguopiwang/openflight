@@ -43,6 +43,16 @@ class ExposureStep:
 
 
 EXPOSURE_STEPS = (
+    # Unity-gain steps for sunlit ranges: 100us x2 still left ~91% of the
+    # impact area clipped on a 2026-10-18 outdoor session. Spaced ~1.5x apart
+    # so each stays distinct after the sensor rounds to whole ~7.3us rows.
+    ExposureStep(15, 1.0),
+    ExposureStep(22, 1.0),
+    ExposureStep(33, 1.0),
+    ExposureStep(50, 1.0, "Bright sun"),
+    ExposureStep(70, 1.0),
+    ExposureStep(100, 1.0),
+    ExposureStep(100, 1.5),
     ExposureStep(100, 2.0),
     ExposureStep(150, 3.0),
     ExposureStep(200, 3.0),

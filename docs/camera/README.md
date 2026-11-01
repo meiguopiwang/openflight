@@ -241,8 +241,10 @@ steps and recheck after `300 ms`, rather than waiting through one five-second
 step at a time. It keeps adjusting while untried steps remain in the needed
 direction, and never returns to a step it has already rejected, so a seed saved
 under different lighting can still reach the far end of the ladder. In the
-worst case this walks the whole ladder (about four seconds at `300 ms` per
-check) before shot capture is armed. The selected manual exposure and gain are
+worst case this walks the whole ladder (about six seconds at `300 ms` per
+check) before shot capture is armed. The darkest steps use 15–100 µs at unity
+gain for sunlit ranges, where 100 µs at 2× gain still clipped most of the
+impact area. The selected manual exposure and gain are
 then locked for the
 life of that camera runtime, so every replay in the session uses the same image
 controls. There is no periodic exposure monitoring after startup.

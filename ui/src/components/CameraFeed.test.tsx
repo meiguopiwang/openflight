@@ -82,6 +82,16 @@ describe('CameraFeed', () => {
     expect(html).toContain('Armed');
   });
 
+  it('shows the live level readout beside auto exposure in the header', () => {
+    const html = renderToString(
+      <CameraFeed captureSettings={captureSettings} captureSettingsError={null} onUpdateCaptureSettings={vi.fn()} />
+    );
+    const header = html.slice(html.indexOf('camera-feed__header-status'), html.indexOf('camera-feed__workspace'));
+
+    expect(header).toContain('level-readout');
+    expect(header.indexOf('level-readout')).toBeLessThan(header.indexOf('camera-feed__exposure-quality'));
+  });
+
   it('explains lighting failure without disabling capture', () => {
     const html = renderToString(
       <CameraFeed

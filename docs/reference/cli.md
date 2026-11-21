@@ -86,7 +86,8 @@ LIS3DH enclosure tilt compensation.
 | Flag | Type / default | Description |
 | --- | --- | --- |
 | `--inclinometer` | flag | Enable LIS3DH enclosure pitch compensation for IWR6843 tilt |
-| `--inclinometer-zero-offset` | float | Degrees added to raw LIS3DH pitch (default: 0) |
+| `--inclinometer-zero-offset` | float | Degrees added to raw LIS3DH pitch. Overrides the Camera tab level calibration (default: saved calibration, else 0) |
+| `--inclinometer-roll-zero-offset` | float | Degrees added to raw LIS3DH sideways lean so a level unit reads 0 (setup readout only). Overrides the Camera tab level calibration (default: saved calibration, else 0) |
 
 ## Ballistics & spin
 

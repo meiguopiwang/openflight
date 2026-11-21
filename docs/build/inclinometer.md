@@ -98,8 +98,10 @@ For the Adafruit board:
 - Z points perpendicular to the board.
 
 The validated installation aligns **Y with the radar tilt direction**. Positive
-Y must increase when the enclosure tilts backward. X/roll is recorded but is not
-currently applied to the launch-angle correction.
+Y must increase when the enclosure tilts backward. With the board flat and Z up,
+X then reads sideways lean: positive when the right side is high, standing
+behind the unit facing the target. Roll is shown on the Camera tab and logged,
+but is not applied to the launch-angle correction.
 
 Before fixing the board permanently, run the readout script and gently tilt the
 enclosure backward. Confirm that the reported pitch becomes more positive.
@@ -179,6 +181,11 @@ uv run python scripts/hardware-test/read_lis3dh.py --address 0x19
 The zero offset corrects only the LIS3DH's own mounting and sensor bias. It does
 not include the TI board's fixed mounting angle.
 
+The easiest way is from the touchscreen; see
+[Calibrate From The Camera Tab](#calibrate-from-the-camera-tab). The script
+below does the same from a terminal and lets you enter a floor that is not
+exactly level.
+
 1. Put the complete enclosure on a firm, stationary surface.
 2. Measure that surface in the radar tilt direction with a phone level app.
 3. Keep the enclosure still and run the calibration helper.
@@ -200,6 +207,64 @@ Recommended flag: --inclinometer-zero-offset +1.501
 
 Record that value in the launch command. The current implementation does not
 write a calibration file.
+
+### Sideways lean
+
+The same helper also recommends a sideways (roll) offset. The board can sit a
+few degrees crooked across the enclosure even when the pitch is right, which
+makes the Camera tab's Lean reading wrong by that amount. Measure the
+enclosure side to side with a digital level and pass it to `--reference-roll`,
+positive when the right side is high:
+
+```bash
+uv run python scripts/hardware-test/calibrate_lis3dh.py --reference-pitch 0.1 --reference-roll 0.3
+```
+
+Add the printed `--inclinometer-roll-zero-offset` value to the launch command,
+or calibrate from the Camera tab instead.
+It only affects the setup readout and the logged `calibrated_roll_deg`; shots
+use pitch alone. To confirm the direction, lift the right side slightly: Lean
+must go up.
+
+## Check Level From The Camera Tab
+
+When `--inclinometer` is enabled, the Camera tab header shows a **Level** box,
+updated twice a second:
+
+- **Tilt**: forward/back relative to the calibrated zero. OpenFlight corrects
+  for it on every shot, so it is shown without a warning colour.
+- **Lean**: sideways lean after the roll offset. Green within ±1°, yellow
+  beyond, because sideways lean is not corrected.
+- **Hold still…** appears while the enclosure moves; angles return once the
+  readings settle.
+
+The same values, plus the radar tilt a shot taken now would use, are available
+from `GET /api/inclinometer/level`.
+
+## Calibrate From The Camera Tab
+
+Tap the **Level** box to open the level dialog. It shows the live angles, the
+radar tilt a shot would use, and where the calibration came from.
+
+1. Put the unit on a level floor. Check the floor with a digital level: the
+   dialog assumes it reads exactly 0° both ways.
+2. Keep the unit still for 3 seconds and tap **Calibrate level**.
+3. Check the before → after readings and tap **Calibrate**.
+
+Both offsets are saved to `~/.config/openflight/inclinometer_calibration.json`
+and applied immediately; no restart is needed. **Undo** restores the offsets
+the calibration replaced.
+
+The forward/back offset changes every shot's launch angle, so the dialog says
+which way launch angles will move. It refuses to calibrate while the unit is
+moving, and refuses offsets larger than 10°, which mean the floor is not level
+or the sensor has come loose.
+
+Startup flags take priority: while `--inclinometer-zero-offset` or
+`--inclinometer-roll-zero-offset` is in the launch command, the button is
+disabled and the dialog says why. Each flag overrides the saved value for its
+own axis; remove both to calibrate from the screen. At startup OpenFlight
+prints each offset and its source (`command_line`, `saved`, or `default`).
 
 ## Measure The Fixed IWR6843 Tilt
 
@@ -336,6 +401,6 @@ mounting angle into `--inclinometer-zero-offset`.
 ## Current Limitations
 
 - Pitch compensation uses the LIS3DH Y direction.
-- X/roll is logged but not yet applied to full 3D boresight compensation.
-- Sensor bus, address, and calibration are command-line/runtime settings rather
-  than a persisted rig configuration file.
+- X/roll is shown and logged but not yet applied to full 3D boresight compensation.
+- Sensor bus and address are command-line settings. Zero offsets come from the
+  launch command or the saved Camera tab calibration.

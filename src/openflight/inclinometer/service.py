@@ -10,7 +10,7 @@ import time
 from collections import deque
 from typing import Protocol
 
-from .models import AccelerationSample, OrientationSnapshot, SnapshotSelection
+from .models import AccelerationSample, LevelReading, OrientationSnapshot, SnapshotSelection
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,11 @@ def pitch_degrees(sample: AccelerationSample) -> float:
     return math.degrees(math.atan2(sample.y_g, math.hypot(sample.x_g, sample.z_g)))
 
 
+def roll_degrees(sample: AccelerationSample) -> float:
+    """Return enclosure sideways lean; positive when the sensor's +X side is raised."""
+    return math.degrees(math.atan2(sample.x_g, math.hypot(sample.y_g, sample.z_g)))
+
+
 class InclinometerService:
     """Sample, filter, and retain stable enclosure orientations."""
 
@@ -44,6 +49,7 @@ class InclinometerService:
         sensor: Accelerometer,
         *,
         zero_offset_deg: float = 0.0,
+        roll_zero_offset_deg: float = 0.0,
         sample_hz: float = 10.0,
         window_samples: int = 8,
         history_seconds: float = 15.0,
@@ -55,6 +61,7 @@ class InclinometerService:
             raise ValueError("sample_hz must be positive and window_samples must be at least 2")
         self.sensor = sensor
         self.zero_offset_deg = zero_offset_deg
+        self.roll_zero_offset_deg = roll_zero_offset_deg
         self.sample_hz = sample_hz
         self.window_samples = window_samples
         self.max_snapshot_age_s = max_snapshot_age_s
@@ -125,6 +132,8 @@ class InclinometerService:
                 self._last_unstable_timestamp = sample.timestamp
                 return None
             raw_pitch = statistics.median(pitches)
+            # Roll is reported for setup only; tilt compensation uses pitch.
+            raw_roll = statistics.median(roll_degrees(item) for item in samples)
             snapshot = OrientationSnapshot(
                 timestamp=sample.timestamp,
                 x_g=x_g,
@@ -135,6 +144,8 @@ class InclinometerService:
                 calibrated_pitch_deg=raw_pitch + self.zero_offset_deg,
                 pitch_std_deg=pitch_std,
                 sample_count=len(samples),
+                raw_roll_deg=raw_roll,
+                calibrated_roll_deg=raw_roll + self.roll_zero_offset_deg,
             )
             self._history.append(snapshot)
             return snapshot
@@ -161,6 +172,47 @@ class InclinometerService:
         if age_s > self.max_snapshot_age_s:
             return SnapshotSelection(snapshot=None, status="stale", age_s=age_s)
         return SnapshotSelection(snapshot=snapshot, status="stable", age_s=age_s)
+
+    def level_reading(
+        self, *, now: float | None = None, duration_s: float = 3.0
+    ) -> tuple[LevelReading | None, str]:
+        """Median raw angles over the last ``duration_s`` if the unit stayed still.
+
+        Returns ``(None, status)`` with ``settling`` until the window is covered,
+        ``moving`` if any sample in it moved, or ``sensor_error``.
+        """
+        now = time.time() if now is None else now
+        start = now - duration_s
+        with self._lock:
+            snapshots = [item for item in self._history if start <= item.timestamp <= now]
+            error_timestamp = self._last_error_timestamp
+            unstable_timestamp = self._last_unstable_timestamp
+        if error_timestamp is not None and start <= error_timestamp <= now:
+            return None, "sensor_error"
+        if unstable_timestamp is not None and start <= unstable_timestamp <= now:
+            return None, "moving"
+        # Require snapshots from the start of the window, not just its end.
+        if not snapshots or snapshots[0].timestamp > start + 0.1 * duration_s:
+            return None, "settling"
+        pitches = [item.raw_pitch_deg for item in snapshots]
+        rolls = [item.raw_roll_deg for item in snapshots]
+        return (
+            LevelReading(
+                raw_pitch_deg=statistics.median(pitches),
+                raw_roll_deg=statistics.median(rolls),
+                pitch_std_deg=statistics.pstdev(pitches),
+                roll_std_deg=statistics.pstdev(rolls),
+                snapshot_count=len(snapshots),
+            ),
+            "stable",
+        )
+
+    def set_zero_offsets(self, *, zero_offset_deg: float, roll_zero_offset_deg: float) -> None:
+        """Apply new zero offsets and drop snapshots calibrated with the old ones."""
+        with self._lock:
+            self.zero_offset_deg = zero_offset_deg
+            self.roll_zero_offset_deg = roll_zero_offset_deg
+            self._history.clear()
 
     def wait_for_stable(self, timeout_s: float = 2.0) -> SnapshotSelection:
         """Wait briefly for a startup orientation diagnostic."""

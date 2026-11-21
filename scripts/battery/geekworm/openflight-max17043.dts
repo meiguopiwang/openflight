@@ -1,0 +1,31 @@
+// Geekworm X1202/X1206 fuel gauge at I2C 0x36 for the max17040_battery driver.
+//
+// Use this instead of "dtoverlay=i2c-sensor,max17040". The kernel resets a
+// gauge declared as MAX17040 every time the driver loads, so each boot throws
+// away the learned charge and restarts the estimate from the battery voltage
+// at that moment: high while charging, low under load. Declared as MAX17043,
+// the gauge keeps its state across Pi reboots while the cells stay installed.
+//
+// Installed by scripts/battery/geekworm/setup.sh as openflight-max17043.dtbo.
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&i2c_arm>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			max17043@36 {
+				compatible = "maxim,max17043";
+				reg = <0x36>;
+				status = "okay";
+			};
+		};
+	};
+};

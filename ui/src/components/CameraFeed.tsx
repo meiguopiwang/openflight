@@ -1,40 +1,43 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useCameraPointerDragScroll } from '../hooks/useCameraPointerDragScroll';
-import type { CameraAutoExposureStatus, CameraCaptureSettings } from '../stores/useCameraStore';
+import type { CameraAutoExposureStatus, CameraCaptureSettings, CameraExposureQuality } from '../stores/useCameraStore';
+import {
+  LIVE_EXPOSURE_LABELS,
+  lightingChangeMessage,
+  lightingChangedSinceStartup,
+  shouldOfferRecalibration,
+} from '../utils/cameraExposure';
 import { verticalViewTargets } from '../utils/cameraView';
 import { getServerOrigin } from '../utils/serverOrigin';
+import { LevelReadout } from './LevelReadout';
 import './CameraFeed.css';
 
 interface CameraFeedProps {
   captureSettings: CameraCaptureSettings;
   captureSettingsError: string | null;
   onUpdateCaptureSettings: (settings: Partial<CameraCaptureSettings>) => void;
+  onRecalibrateExposure?: () => void;
 }
 
 interface CaptureSettingsPanelProps {
   settings: CameraCaptureSettings;
-  exposureQuality: ExposureQuality | null;
+  exposureQuality: CameraExposureQuality | null;
   error: string | null;
   onUpdate: (settings: Partial<CameraCaptureSettings>) => void;
+  onRecalibrate?: () => void;
+  /** True between a tap and the next status poll, so one tap sends one request. */
+  recalibrationPending?: boolean;
 }
 
 const PREVIEW_URL = `${getServerOrigin()}/api/camera/preview.jpg`;
 const EXPOSURE_QUALITY_URL = `${getServerOrigin()}/api/camera/exposure-quality`;
 const PREVIEW_REFRESH_MS = 5000;
+// Re-poll soon after a recalibration tap so the panel shows "Adjusting" promptly.
+const RECALIBRATION_STATUS_REFRESH_MS = 300;
 const BALL_GUIDE_X_PCT = 50;
 const BALL_GUIDE_Y_PCT = 78;
 
 type PreviewState = 'checking' | 'available' | 'unavailable';
-
-interface ExposureQuality {
-  sample_available: boolean;
-  status: 'good' | 'too_dark' | 'too_bright' | 'marginal' | 'unavailable';
-  recommendation?: 'brighter' | 'darker' | 'hold';
-  message?: string;
-  clipped_pct?: number;
-  contrast?: number;
-  auto_exposure?: CameraAutoExposureStatus;
-}
 
 const AUTO_EXPOSURE_LABELS: Record<CameraAutoExposureStatus['status'], string> = {
   ready: 'Ready',
@@ -43,7 +46,14 @@ const AUTO_EXPOSURE_LABELS: Record<CameraAutoExposureStatus['status'], string> =
   unavailable: 'Waiting',
 };
 
-function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: CaptureSettingsPanelProps) {
+export function CaptureSettingsPanel({
+  settings,
+  exposureQuality,
+  error,
+  onUpdate,
+  onRecalibrate,
+  recalibrationPending = false,
+}: CaptureSettingsPanelProps) {
   const verticalOffset = settings.vertical_offset_px ?? 0;
   const verticalMin = settings.vertical_offset_min_px ?? verticalOffset;
   const verticalMax = settings.vertical_offset_max_px ?? verticalOffset;
@@ -52,10 +62,18 @@ function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: Ca
   const viewUpOffset = viewTargets.up;
   const viewDownOffset = viewTargets.down;
   const autoExposure = exposureQuality?.auto_exposure ?? settings.auto_exposure;
-  const exposureObservation = autoExposure?.observation;
+  const liveStatus = exposureQuality?.status;
+  // Prefer the latest frame; before the first poll, fall back to the startup sample.
+  const reading = exposureQuality?.sample_available ? exposureQuality : autoExposure?.observation;
+  const lightingChanged = lightingChangedSinceStartup(autoExposure, liveStatus);
   const exposureStatus = autoExposure?.capture_deferred
     ? 'Capturing shot'
     : AUTO_EXPOSURE_LABELS[autoExposure?.status ?? 'unavailable'];
+  const exposureMessage =
+    lightingChanged && liveStatus
+      ? `Lighting has changed since startup. ${lightingChangeMessage(liveStatus)}`
+      : (autoExposure?.message ?? 'Waiting for the first camera check');
+  const offerRecalibration = onRecalibrate !== undefined && shouldOfferRecalibration(autoExposure, liveStatus);
 
   return (
     <aside className="camera-settings">
@@ -100,17 +118,27 @@ function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: Ca
         <section className="camera-settings__section">
           <div className="camera-settings__section-title">
             <span>Automatic exposure</span>
-            <small>calibrates once at startup</small>
+            <small>calibrates at startup or on request</small>
           </div>
           <div
             className={`camera-settings__auto-status camera-settings__auto-status--${autoExposure?.status ?? 'unavailable'}`}
           >
             <div>
               <strong>{exposureStatus}</strong>
-              <span>{autoExposure?.message ?? 'Waiting for the first camera check'}</span>
+              <span>{exposureMessage}</span>
             </div>
             <span className="camera-settings__auto-dot" aria-hidden="true" />
           </div>
+          {offerRecalibration && (
+            <button
+              type="button"
+              className="camera-settings__recalibrate"
+              disabled={recalibrationPending}
+              onClick={onRecalibrate}
+            >
+              {recalibrationPending ? 'Recalibrating…' : 'Recalibrate exposure'}
+            </button>
+          )}
           <dl className="camera-settings__exposure-metrics">
             <div>
               <dt>Shutter</dt>
@@ -121,12 +149,20 @@ function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: Ca
               <dd>{autoExposure?.gain ?? settings.gain ?? '—'}×</dd>
             </div>
             <div>
+              <dt>Live view</dt>
+              <dd>{LIVE_EXPOSURE_LABELS[liveStatus ?? 'unavailable']}</dd>
+            </div>
+            <div>
               <dt>Impact median</dt>
-              <dd>{exposureObservation?.median ?? '—'}</dd>
+              <dd>{reading?.median ?? '—'}</dd>
             </div>
             <div>
               <dt>Contrast</dt>
-              <dd>{exposureObservation?.contrast ?? exposureQuality?.contrast ?? '—'}</dd>
+              <dd>{reading?.contrast ?? '—'}</dd>
+            </div>
+            <div>
+              <dt>White</dt>
+              <dd>{reading?.clipped_pct != null ? <>{reading.clipped_pct}%</> : '—'}</dd>
             </div>
           </dl>
           <div
@@ -203,12 +239,19 @@ function CaptureSettingsPanel({ settings, exposureQuality, error, onUpdate }: Ca
  * still refreshed every 5 s from the concurrent preview stream. The raw
  * rolling buffer keeps running, so shots are never missed while viewing.
  */
-export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCaptureSettings }: CameraFeedProps) {
+export function CameraFeed({
+  captureSettings,
+  captureSettingsError,
+  onUpdateCaptureSettings,
+  onRecalibrateExposure,
+}: CameraFeedProps) {
   useCameraPointerDragScroll();
   const [previewState, setPreviewState] = useState<PreviewState>('checking');
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [exposureQuality, setExposureQuality] = useState<ExposureQuality | null>(null);
+  const [exposureQuality, setExposureQuality] = useState<CameraExposureQuality | null>(null);
+  const [recalibrationPending, setRecalibrationPending] = useState(false);
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
   const crosshairStyle = {
     '--camera-crosshair-x': `${BALL_GUIDE_X_PCT}%`,
     '--camera-crosshair-y': `${BALL_GUIDE_Y_PCT}%`,
@@ -240,20 +283,31 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
         const qualityResponse = await fetch(`${EXPOSURE_QUALITY_URL}?t=${Date.now()}`, { cache: 'no-store' });
         if (qualityResponse.ok && !cancelled) {
           setExposureQuality(await qualityResponse.json());
+          setRecalibrationPending(false);
         }
       } catch {
         // Keep the last frame and retry after a transient network failure.
       }
     };
 
+    refreshRef.current = refresh;
     refresh();
     timer = setInterval(refresh, PREVIEW_REFRESH_MS);
     return () => {
       cancelled = true;
+      refreshRef.current = null;
       if (timer) clearInterval(timer);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, []);
+
+  const recalibrate = onRecalibrateExposure
+    ? () => {
+        setRecalibrationPending(true);
+        onRecalibrateExposure();
+        setTimeout(() => refreshRef.current?.(), RECALIBRATION_STATUS_REFRESH_MS);
+      }
+    : undefined;
 
   if (previewState === 'available' || previewState === 'checking') {
     return (
@@ -264,12 +318,12 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
             <h2 className="camera-feed__title">Camera alignment</h2>
           </div>
           <div className="camera-feed__header-status">
+            <LevelReadout />
             <span
               className={`camera-feed__exposure-quality camera-feed__exposure-quality--${exposureQuality?.status ?? 'checking'}`}
               title={exposureQuality?.message ?? 'Analyzing the impact area'}
             >
-              Auto exposure:{' '}
-              {exposureQuality?.auto_exposure ? AUTO_EXPOSURE_LABELS[exposureQuality.auto_exposure.status] : 'checking'}
+              Live view: {exposureQuality ? LIVE_EXPOSURE_LABELS[exposureQuality.status] : 'checking'}
             </span>
             {lastUpdated && <span className="camera-feed__timestamp">preview {lastUpdated.toLocaleTimeString()}</span>}
           </div>
@@ -319,6 +373,8 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
             exposureQuality={exposureQuality}
             error={captureSettingsError}
             onUpdate={onUpdateCaptureSettings}
+            onRecalibrate={recalibrate}
+            recalibrationPending={recalibrationPending}
           />
         </div>
       </div>
@@ -330,6 +386,7 @@ export function CameraFeed({ captureSettings, captureSettingsError, onUpdateCapt
       <div className="camera-feed__message">
         <h3>Camera Not Available</h3>
         <p>Start the server with --camera-capture to enable previews.</p>
+        <LevelReadout />
       </div>
     </div>
   );

@@ -10,7 +10,7 @@ from openflight.inclinometer import (
     InclinometerService,
     LIS3DHIdentityError,
 )
-from openflight.inclinometer.service import pitch_degrees
+from openflight.inclinometer.service import pitch_degrees, roll_degrees
 
 
 def _axis_bytes(value_g: float) -> list[int]:
@@ -67,6 +67,61 @@ def test_pitch_is_positive_when_sensor_y_tilts_back():
     sample = AccelerationSample(1.0, 0.0, math.sin(angle), math.cos(angle))
 
     assert pitch_degrees(sample) == pytest.approx(12.0)
+
+
+def test_roll_is_positive_when_sensor_x_side_is_raised():
+    angle = math.radians(4.0)
+    sample = AccelerationSample(1.0, math.sin(angle), 0.0, math.cos(angle))
+
+    assert roll_degrees(sample) == pytest.approx(4.0)
+    assert pitch_degrees(sample) == pytest.approx(0.0)
+
+
+def test_roll_and_pitch_stay_independent_when_both_tilt():
+    pitch = math.radians(9.0)
+    roll = math.radians(-4.0)
+    # Gravity seen by a sensor pitched about X, then rolled about Y.
+    sample = AccelerationSample(
+        1.0,
+        math.sin(roll),
+        math.cos(roll) * math.sin(pitch),
+        math.cos(roll) * math.cos(pitch),
+    )
+
+    assert roll_degrees(sample) == pytest.approx(-4.0)
+    assert pitch_degrees(sample) == pytest.approx(
+        math.degrees(math.asin(math.cos(roll) * math.sin(pitch)))
+    )
+
+
+def test_snapshot_applies_the_roll_offset_to_roll_and_the_pitch_offset_to_pitch():
+    """The chip can sit crooked sideways; each axis has its own zero offset."""
+    service = InclinometerService(
+        sensor=None, zero_offset_deg=1.5, roll_zero_offset_deg=-3.07, window_samples=3
+    )
+    for timestamp, roll_deg in zip((1.0, 1.1, 1.2), (3.27, 3.47, 3.37)):
+        angle = math.radians(roll_deg)
+        snapshot = service.add_sample(
+            AccelerationSample(timestamp, math.sin(angle), 0.0, math.cos(angle))
+        )
+
+    assert snapshot.raw_roll_deg == pytest.approx(3.37)
+    assert snapshot.calibrated_roll_deg == pytest.approx(0.30)
+    assert snapshot.calibrated_pitch_deg == pytest.approx(1.5)
+    data = snapshot.to_dict()
+    assert data["raw_roll_deg"] == 3.37
+    assert data["calibrated_roll_deg"] == 0.3
+
+
+def test_roll_offset_defaults_to_zero():
+    service = InclinometerService(sensor=None, window_samples=2)
+    angle = math.radians(2.0)
+    for timestamp in (1.0, 1.1):
+        snapshot = service.add_sample(
+            AccelerationSample(timestamp, math.sin(angle), 0.0, math.cos(angle))
+        )
+
+    assert snapshot.calibrated_roll_deg == pytest.approx(snapshot.raw_roll_deg)
 
 
 def test_service_applies_zero_offset_and_selects_preimpact_snapshot():
@@ -133,3 +188,86 @@ def test_service_does_not_reuse_old_position_after_movement():
     selection = service.snapshot_for_impact(1.35)
     assert selection.status == "moving"
     assert selection.snapshot is None
+
+
+def _feed_still(service, start, count, *, pitch_deg=0.0, roll_deg=0.0, step=0.1):
+    pitch = math.radians(pitch_deg)
+    roll = math.radians(roll_deg)
+    for index in range(count):
+        service.add_sample(
+            AccelerationSample(
+                start + index * step,
+                math.sin(roll),
+                math.cos(roll) * math.sin(pitch),
+                math.cos(roll) * math.cos(pitch),
+            )
+        )
+
+
+def test_level_reading_averages_a_still_window():
+    service = InclinometerService(sensor=None, sample_hz=10.0, window_samples=4)
+    _feed_still(service, 10.0, 40, pitch_deg=-1.45, roll_deg=3.35)
+
+    reading, status = service.level_reading(now=13.95, duration_s=3.0)
+
+    assert status == "stable"
+    assert reading.raw_pitch_deg == pytest.approx(-1.45, abs=0.01)
+    assert reading.raw_roll_deg == pytest.approx(3.35, abs=1e-6)
+    assert reading.snapshot_count >= 28
+    assert reading.pitch_std_deg == pytest.approx(0.0, abs=1e-6)
+
+
+def test_level_reading_needs_the_full_window_after_startup():
+    service = InclinometerService(sensor=None, sample_hz=10.0, window_samples=4)
+    _feed_still(service, 10.0, 12)
+
+    reading, status = service.level_reading(now=11.15, duration_s=3.0)
+
+    assert reading is None
+    assert status == "settling"
+
+
+def test_level_reading_refuses_when_the_unit_moved_in_the_window():
+    service = InclinometerService(
+        sensor=None, sample_hz=10.0, window_samples=4, max_pitch_std_deg=0.2
+    )
+    _feed_still(service, 10.0, 20)
+    _feed_still(service, 12.0, 1, pitch_deg=8.0)  # a bump
+    _feed_still(service, 12.1, 20)
+
+    reading, status = service.level_reading(now=14.05, duration_s=3.0)
+
+    assert reading is None
+    assert status == "moving"
+
+
+def test_level_reading_reports_a_sensor_error_in_the_window():
+    service = InclinometerService(sensor=None, sample_hz=10.0, window_samples=4)
+    _feed_still(service, 10.0, 40)
+    service._last_error = "I2C read failed"  # pylint: disable=protected-access
+    service._last_error_timestamp = 13.0  # pylint: disable=protected-access
+
+    reading, status = service.level_reading(now=13.95, duration_s=3.0)
+
+    assert reading is None
+    assert status == "sensor_error"
+
+
+def test_set_zero_offsets_applies_to_new_snapshots_and_drops_old_ones():
+    service = InclinometerService(
+        sensor=None, zero_offset_deg=1.663, roll_zero_offset_deg=-3.05, window_samples=3
+    )
+    _feed_still(service, 1.0, 5, pitch_deg=-1.45, roll_deg=3.35)
+    assert service.snapshot_for_impact(1.45).snapshot.calibrated_pitch_deg == pytest.approx(
+        0.213, abs=0.01
+    )
+
+    service.set_zero_offsets(zero_offset_deg=1.45, roll_zero_offset_deg=-3.35)
+
+    # Snapshots taken with the old offsets must never reach a shot.
+    assert service.snapshot_for_impact(1.45).snapshot is None
+    _feed_still(service, 1.5, 1, pitch_deg=-1.45, roll_deg=3.35)
+    snapshot = service.snapshot_for_impact(1.55).snapshot
+    assert snapshot.calibrated_pitch_deg == pytest.approx(0.0, abs=0.01)
+    assert snapshot.calibrated_roll_deg == pytest.approx(0.0, abs=1e-6)
+    assert (service.zero_offset_deg, service.roll_zero_offset_deg) == (1.45, -3.35)

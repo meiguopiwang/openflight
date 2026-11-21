@@ -43,6 +43,16 @@ class ExposureStep:
 
 
 EXPOSURE_STEPS = (
+    # Unity-gain steps for sunlit ranges: 100us x2 still left ~91% of the
+    # impact area clipped on a 2026-10-18 outdoor session. Spaced ~1.5x apart
+    # so each stays distinct after the sensor rounds to whole ~7.3us rows.
+    ExposureStep(15, 1.0),
+    ExposureStep(22, 1.0),
+    ExposureStep(33, 1.0),
+    ExposureStep(50, 1.0, "Bright sun"),
+    ExposureStep(70, 1.0),
+    ExposureStep(100, 1.0),
+    ExposureStep(100, 1.5),
     ExposureStep(100, 2.0),
     ExposureStep(150, 3.0),
     ExposureStep(200, 3.0),
@@ -54,9 +64,11 @@ EXPOSURE_STEPS = (
     ExposureStep(500, 12.0, "Indoor bright"),
     ExposureStep(500, 15.0),
     ExposureStep(650, 15.0, "Indoor dark"),
-    ExposureStep(800, 18.0),
-    ExposureStep(1000, 20.0, "Night"),
-    ExposureStep(1250, 16.0, "Facility dark"),
+    # The OV9281 gain register tops out at 255/16 = 15.94x; higher requests
+    # were silently clamped, so the brightest steps add shutter time instead.
+    ExposureStep(900, 15.9),
+    ExposureStep(1100, 15.9, "Night"),
+    ExposureStep(1250, 15.9, "Facility dark"),
 )
 
 
@@ -204,20 +216,31 @@ class AutoExposurePolicy:
         self,
         *,
         fps: float,
-        startup_max_adjustments: int = 3,
+        startup_max_adjustments: int | None = None,
     ):
+        self.steps = exposure_steps_for_fps(fps)
+        # By default startup may visit every step once: a saved seed from a
+        # different lighting environment can sit at the opposite end of the
+        # ladder, and partly clipped scenes move only one step per check.
+        if startup_max_adjustments is None:
+            startup_max_adjustments = max(1, len(self.steps) - 1)
         if startup_max_adjustments < 1:
             raise ValueError("startup_max_adjustments must be positive")
-        self.steps = exposure_steps_for_fps(fps)
         self.startup_max_adjustments = startup_max_adjustments
         self._startup = True
         self._startup_adjustments = 0
+        self._rejected_indices: set[int] = set()
+        self._usable_fallback_index: int | None = None
+        self._restoring_usable_fallback = False
         self._locked_decision: AutoExposureDecision | None = None
 
     def _reset_startup_state(self) -> None:
         """Enter startup convergence and clear any prior locked result."""
         self._startup = True
         self._startup_adjustments = 0
+        self._rejected_indices = set()
+        self._usable_fallback_index = None
+        self._restoring_usable_fallback = False
         self._locked_decision: AutoExposureDecision | None = None
 
     def reset(self) -> None:
@@ -253,19 +276,86 @@ class AutoExposurePolicy:
                 motion_blur_risk=risk,
             )
 
+        if observation.status == "good" or (
+            observation.acceptable and self._restoring_usable_fallback
+        ):
+            return self._lock_ready(observation, risk)
         if observation.acceptable:
-            self._startup = False
-            self._startup_adjustments = 0
-            self._locked_decision = AutoExposureDecision(
-                status="ready",
-                analysis_eligible=True,
-                message=observation.message,
-                observation=observation,
-                motion_blur_risk=risk,
-            )
-            return self._locked_decision
+            return self._refine_usable(observation, current_index, risk)
+        if self._usable_fallback_index is not None and not self._restoring_usable_fallback:
+            return self._restore_usable_fallback(observation, current_index)
 
+        # The light changed while returning to a usable step: search normally.
+        self._usable_fallback_index = None
+        self._restoring_usable_fallback = False
         return self._startup_decision(observation, current_index)
+
+    def _lock_ready(
+        self,
+        observation: ExposureObservation,
+        risk: Literal["low", "elevated", "high"],
+    ) -> AutoExposureDecision:
+        self._startup = False
+        self._startup_adjustments = 0
+        self._locked_decision = AutoExposureDecision(
+            status="ready",
+            analysis_eligible=True,
+            message=observation.message,
+            observation=observation,
+            motion_blur_risk=risk,
+        )
+        return self._locked_decision
+
+    def _refine_usable(
+        self,
+        observation: ExposureObservation,
+        current_index: int,
+        risk: Literal["low", "elevated", "high"],
+    ) -> AutoExposureDecision:
+        """Try the suggested neighbor of a "marginal" step before settling for it.
+
+        Remembers this step so a worse neighbor sends the camera straight back.
+        """
+        self._usable_fallback_index = current_index
+        self._rejected_indices.add(current_index)
+        direction = {"brighter": 1, "darker": -1}.get(observation.recommendation, 0)
+        neighbor = current_index + direction
+        if (
+            direction == 0
+            or not 0 <= neighbor < len(self.steps)
+            or neighbor in self._rejected_indices
+            or self._startup_adjustments >= self.startup_max_adjustments
+        ):
+            return self._lock_ready(observation, risk)
+
+        self._startup_adjustments += 1
+        target = self.steps[neighbor]
+        return AutoExposureDecision(
+            status="adjusting",
+            analysis_eligible=False,
+            message="Fine-tuning camera exposure",
+            observation=observation,
+            target=target,
+            motion_blur_risk=motion_blur_risk(target.exposure_us),
+        )
+
+    def _restore_usable_fallback(
+        self,
+        observation: ExposureObservation,
+        current_index: int,
+    ) -> AutoExposureDecision:
+        """Return to the last usable step after a neighbor turned out worse."""
+        self._rejected_indices.add(current_index)
+        self._restoring_usable_fallback = True
+        target = self.steps[self._usable_fallback_index]
+        return AutoExposureDecision(
+            status="adjusting",
+            analysis_eligible=False,
+            message="Returning to the best usable camera exposure",
+            observation=observation,
+            target=target,
+            motion_blur_risk=motion_blur_risk(target.exposure_us),
+        )
 
     def _startup_decision(
         self,
@@ -285,6 +375,7 @@ class AutoExposurePolicy:
             )
             return self._locked_decision
 
+        self._rejected_indices.add(current_index)
         target_index = self._startup_target_index(observation, current_index)
         if target_index == current_index:
             self._startup = False
@@ -323,14 +414,25 @@ class AutoExposurePolicy:
             range(len(self.steps)),
             key=lambda index: abs(math.log(self.steps[index].signal / target_signal)),
         )
+        # Only move into steps strictly between the current step and the
+        # nearest already-rejected step in that direction, so an overshoot
+        # narrows the search instead of bouncing between two failed steps.
         if observation.recommendation == "brighter":
-            return (
-                max(current_index + 1, target_index)
-                if current_index < len(self.steps) - 1
-                else current_index
+            ceiling = min(
+                (index for index in self._rejected_indices if index > current_index),
+                default=len(self.steps),
             )
+            if current_index + 1 >= ceiling:
+                return current_index
+            return min(max(current_index + 1, target_index), ceiling - 1)
         if observation.recommendation == "darker":
-            return min(current_index - 1, target_index) if current_index > 0 else current_index
+            floor = max(
+                (index for index in self._rejected_indices if index < current_index),
+                default=-1,
+            )
+            if current_index - 1 <= floor:
+                return current_index
+            return max(min(current_index - 1, target_index), floor + 1)
         return current_index
 
     def _nearest_step_index(self, exposure_us: int, gain: float) -> int:

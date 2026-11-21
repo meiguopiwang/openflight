@@ -264,6 +264,10 @@ class SocketService {
   setCameraCaptureSettings(settings: Partial<CameraCaptureSettings>) {
     this.socket?.emit('set_camera_capture_settings', settings);
   }
+
+  recalibrateCameraExposure() {
+    this.socket?.emit('recalibrate_camera_exposure');
+  }
 }
 
 export const socketService = new SocketService();

@@ -125,6 +125,97 @@ class TestCameraCaptureSettings:
         assert emitted[-1][1]["raw_crop_adjustable"] is True
         assert emitted[-1][1]["vertical_offset_px"] == -10
 
+    def test_recalibrate_exposure_starts_runtime_and_reports_progress(self, monkeypatch):
+        emitted = []
+        logged = []
+        requested = []
+
+        class FakeRuntime:
+            settings = SimpleNamespace(fps=450.0, exposure_us=1250, gain=15.9)
+
+            @staticmethod
+            def request_exposure_recalibration():
+                requested.append(True)
+
+            @staticmethod
+            def status():
+                return {
+                    "running": True,
+                    "armed": True,
+                    "auto_exposure": {"status": "adjusting", "analysis_eligible": False},
+                }
+
+            @staticmethod
+            def vertical_crop_status():
+                return {"raw_crop_adjustable": False, "vertical_offset_px": 0}
+
+        monkeypatch.setattr(server_module, "camera_capture_runtime", FakeRuntime())
+        monkeypatch.setattr(server_module, "camera_capture_config", {"enabled": True})
+        monkeypatch.setattr(
+            server_module,
+            "get_session_logger",
+            lambda: SimpleNamespace(
+                log_config_change=lambda config, source: logged.append((config, source))
+            ),
+        )
+        monkeypatch.setattr(
+            server_module.socketio,
+            "emit",
+            lambda event, payload: emitted.append((event, payload)),
+        )
+
+        server_module.handle_recalibrate_camera_exposure()
+
+        assert requested == [True]
+        assert logged == [({"camera_exposure_recalibration": "requested"}, "camera_ui")]
+        assert emitted[-1][0] == "camera_capture_settings"
+        assert emitted[-1][1]["auto_exposure"]["status"] == "adjusting"
+
+    def test_recalibrate_exposure_reports_busy_runtime(self, monkeypatch):
+        emitted = []
+
+        def busy():
+            raise RuntimeError("camera is already recalibrating or restarting")
+
+        monkeypatch.setattr(
+            server_module,
+            "camera_capture_runtime",
+            SimpleNamespace(request_exposure_recalibration=busy),
+        )
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(
+            server_module.socketio,
+            "emit",
+            lambda event, payload: emitted.append((event, payload)),
+        )
+
+        server_module.handle_recalibrate_camera_exposure()
+
+        assert emitted == [
+            (
+                "camera_capture_settings_error",
+                {"error": "camera is already recalibrating or restarting"},
+            )
+        ]
+
+    def test_recalibrate_exposure_without_camera_reports_error(self, monkeypatch):
+        emitted = []
+        monkeypatch.setattr(server_module, "camera_capture_runtime", None)
+        monkeypatch.setattr(
+            server_module.socketio,
+            "emit",
+            lambda event, payload: emitted.append((event, payload)),
+        )
+
+        server_module.handle_recalibrate_camera_exposure()
+
+        assert emitted == [
+            (
+                "camera_capture_settings_error",
+                {"error": "High-speed camera capture is not running"},
+            )
+        ]
+
     def test_update_rejects_manual_exposure_override(self, monkeypatch):
         emitted = []
         runtime = SimpleNamespace(

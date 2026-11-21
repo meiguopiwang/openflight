@@ -31,6 +31,21 @@ export interface CameraCaptureSettings {
   auto_exposure?: CameraAutoExposureStatus;
 }
 
+export type CameraExposureObservationStatus = 'good' | 'too_dark' | 'too_bright' | 'marginal' | 'unavailable';
+
+/** Impact-area brightness rating from one frame (server `measure_exposure`). */
+export interface CameraExposureObservation {
+  sample_available: boolean;
+  status: CameraExposureObservationStatus;
+  recommendation?: 'brighter' | 'darker' | 'hold';
+  message?: string;
+  median?: number | null;
+  p90?: number | null;
+  contrast?: number | null;
+  clipped_pct?: number | null;
+  dark_pct?: number | null;
+}
+
 export interface CameraAutoExposureStatus {
   enabled: boolean;
   status: 'ready' | 'adjusting' | 'lighting_required' | 'unavailable';
@@ -40,17 +55,13 @@ export interface CameraAutoExposureStatus {
   capture_deferred?: boolean;
   exposure_us?: number;
   gain?: number;
-  observation?: {
-    sample_available: boolean;
-    status: 'good' | 'too_dark' | 'too_bright' | 'marginal' | 'unavailable';
-    recommendation?: 'brighter' | 'darker' | 'hold';
-    message?: string;
-    median?: number | null;
-    p90?: number | null;
-    contrast?: number | null;
-    clipped_pct?: number | null;
-    dark_pct?: number | null;
-  };
+  /** The observation that produced the startup (locked) decision. */
+  observation?: CameraExposureObservation;
+}
+
+/** `/api/camera/exposure-quality`: the latest frame plus the locked startup state. */
+export interface CameraExposureQuality extends CameraExposureObservation {
+  auto_exposure?: CameraAutoExposureStatus;
 }
 
 interface CameraState {

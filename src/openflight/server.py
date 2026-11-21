@@ -1260,8 +1260,6 @@ def api_screen_sleep():
         return jsonify({"error": "Unable to control backlight"}), 500
 
 
-
-
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     """Cleanly shut down the server via REST API."""
@@ -1907,6 +1905,30 @@ def handle_set_camera_capture_settings(data):
         socketio.emit("camera_capture_settings_error", {"error": str(error)})
 
 
+@socketio.on("recalibrate_camera_exposure")
+def handle_recalibrate_camera_exposure():
+    """Re-run automatic exposure in the background; capture stays armed."""
+    if camera_capture_runtime is None:
+        socketio.emit(
+            "camera_capture_settings_error",
+            {"error": "High-speed camera capture is not running"},
+        )
+        return
+    try:
+        camera_capture_runtime.request_exposure_recalibration()
+    except RuntimeError as error:
+        logger.warning("[SERVER] Camera exposure recalibration rejected: %s", error)
+        socketio.emit("camera_capture_settings_error", {"error": str(error)})
+        return
+    session_log = get_session_logger()
+    if session_log:
+        session_log.log_config_change(
+            {"camera_exposure_recalibration": "requested"},
+            source="camera_ui",
+        )
+    socketio.emit("camera_capture_settings", _camera_capture_settings_payload())
+
+
 def start_debug_logging():
     """Start logging raw readings to a file."""
     global debug_log_file, debug_log_path  # pylint: disable=global-statement
@@ -2440,7 +2462,8 @@ _manual_radar_recovery_lock = threading.Lock()
 @socketio.on("reinitialize_radar")
 def handle_reinitialize_radar():
     """Operator-requested OPS recovery; sound-trigger mode only, no flash writes."""
-    from .rolling_buffer.monitor import RollingBufferMonitor  # pylint: disable=import-outside-toplevel
+    # pylint: disable-next=import-outside-toplevel
+    from .rolling_buffer.monitor import RollingBufferMonitor
 
     if mock_mode or not isinstance(monitor, RollingBufferMonitor):
         return {"ok": False, "message": "Recovery requires a real rolling-buffer radar"}

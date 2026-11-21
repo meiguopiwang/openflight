@@ -370,6 +370,7 @@ function AppContent() {
             captureSettings={captureSettings}
             captureSettingsError={captureSettingsError}
             onUpdateCaptureSettings={(settings) => socketService.setCameraCaptureSettings(settings)}
+            onRecalibrateExposure={() => socketService.recalibrateCameraExposure()}
           />
         )}
         {currentView === 'debug' && (

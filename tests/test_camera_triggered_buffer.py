@@ -707,3 +707,206 @@ def test_vertical_crop_update_rejects_unsafe_or_unaligned_offsets(tmp_path, offs
 
     with pytest.raises(ValueError, match="vertical crop"):
         runtime.update_vertical_crop(offset)
+
+
+class _ControlCamera:
+    """Fake camera whose frames follow the applied exposure and gain."""
+
+    def __init__(self, runtime, scene_per_signal):
+        self.runtime = runtime
+        self.scene_per_signal = scene_per_signal
+        self.controls = []
+
+    def set_controls(self, controls):
+        self.controls.append(controls)
+        self.add_frame(controls["ExposureTime"], controls["AnalogueGain"])
+
+    def add_frame(self, exposure_us, gain):
+        # A horizontal gradient keeps contrast; brightness scales with signal.
+        level = self.scene_per_signal * exposure_us * gain
+        ramp = np.linspace(0.6, 1.4, 320)
+        image = np.clip(np.tile(ramp * level, (200, 1)), 0, 255).astype(np.uint8)
+        self.runtime._ring.add_frame(
+            CameraFrame(
+                image=image,
+                sensor_timestamp_ns=len(self.controls) + 1,
+                host_timestamp_ns=len(self.controls) + 2,
+                exposure_us=exposure_us,
+                analogue_gain=gain,
+            )
+        )
+
+
+def _locked_runtime(tmp_path, *, exposure_us=1250, gain=15.9, pre_ms=1.0):
+    """A running runtime whose startup calibration already locked."""
+    runtime = CameraCaptureRuntime(
+        output_dir=tmp_path,
+        settings=CameraCaptureSettings(
+            fps=450.0,
+            pre_ms=pre_ms,
+            post_ms=1.0,
+            exposure_us=exposure_us,
+            gain=gain,
+        ),
+    )
+    runtime._running = True
+    return runtime
+
+
+def test_recalibration_returns_immediately_and_withholds_camera_analysis(tmp_path, monkeypatch):
+    runtime = _locked_runtime(tmp_path)
+    runtime._camera = _ControlCamera(runtime, scene_per_signal=0.0)
+    loop_started = threading.Event()
+    release_loop = threading.Event()
+
+    def blocked_loop():
+        loop_started.set()
+        assert release_loop.wait(timeout=2.0)
+
+    monkeypatch.setattr(runtime, "_auto_exposure_loop", blocked_loop)
+
+    runtime.request_exposure_recalibration()
+    assert loop_started.wait(timeout=1.0)
+    status = runtime.auto_exposure_status()
+    assert status["status"] == "adjusting"
+    assert status["analysis_eligible"] is False
+    assert runtime.camera_analysis_eligible is False
+
+    with pytest.raises(RuntimeError, match="already recalibrating"):
+        runtime.request_exposure_recalibration()
+
+    release_loop.set()
+    runtime._recalibration_thread.join(timeout=2.0)
+    assert not runtime._recalibration_thread.is_alive()
+    # The lock is released, so a later request is accepted again.
+    runtime.request_exposure_recalibration()
+    runtime._recalibration_thread.join(timeout=2.0)
+
+
+def test_trigger_during_recalibration_records_radar_fallback(tmp_path, monkeypatch):
+    runtime = _locked_runtime(tmp_path)
+    runtime._camera = _ControlCamera(runtime, scene_per_signal=0.0)
+    for _ in range(runtime.settings.pre_frames):
+        runtime._camera.add_frame(1250, 15.9)
+    release_loop = threading.Event()
+    monkeypatch.setattr(runtime, "_auto_exposure_loop", lambda: release_loop.wait(timeout=2.0))
+
+    runtime.request_exposure_recalibration()
+    assert runtime.notify_trigger(timestamp=123.0)
+    release_loop.set()
+    runtime._recalibration_thread.join(timeout=2.0)
+
+    snapshot = runtime._trigger_auto_exposure.get_nowait()
+    assert snapshot["status"] == "adjusting"
+    assert snapshot["analysis_eligible"] is False
+
+
+def test_recalibration_walks_from_a_dark_lock_to_a_usable_bright_setting(tmp_path, monkeypatch):
+    """Booted in the dark, then lit: recalibration must not need a restart."""
+    monkeypatch.setattr(capture_runtime, "AUTO_EXPOSURE_STARTUP_SETTLE_S", 0.0)
+    runtime = _locked_runtime(tmp_path)
+    # ~110 grey at 250us x4, i.e. the dark-locked 1250us x15.9 clips fully.
+    camera = _ControlCamera(runtime, scene_per_signal=110 / 1000)
+    runtime._camera = camera
+    camera.add_frame(1250, 15.9)
+
+    runtime.request_exposure_recalibration()
+    runtime._recalibration_thread.join(timeout=5.0)
+
+    status = runtime.auto_exposure_status()
+    assert status["status"] == "ready"
+    assert status["analysis_eligible"] is True
+    assert runtime.settings.exposure_us * runtime.settings.gain < 1250 * 15.9
+    assert camera.controls, "recalibration must apply new controls live"
+
+
+def test_recalibration_keeps_analysis_withheld_until_the_ring_refills(tmp_path, monkeypatch):
+    monkeypatch.setattr(capture_runtime, "AUTO_EXPOSURE_STARTUP_SETTLE_S", 0.0)
+    runtime = _locked_runtime(tmp_path)
+    camera = _ControlCamera(runtime, scene_per_signal=110 / 1000)
+    runtime._camera = camera
+    camera.add_frame(250, 4.0)
+    refill_started = threading.Event()
+    finish_refill = threading.Event()
+
+    def blocked_refill():
+        refill_started.set()
+        return finish_refill.wait(timeout=2.0)
+
+    monkeypatch.setattr(runtime, "_wait_for_recalibrated_prebuffer", blocked_refill)
+
+    runtime.request_exposure_recalibration()
+    assert refill_started.wait(timeout=2.0)
+    during_refill = runtime.auto_exposure_status()
+    finish_refill.set()
+    runtime._recalibration_thread.join(timeout=2.0)
+
+    assert during_refill["analysis_eligible"] is False
+    assert "buffer" in during_refill["message"]
+    assert runtime.auto_exposure_status()["status"] == "ready"
+    assert runtime.camera_analysis_eligible is True
+
+
+def test_recalibration_reports_lighting_needed_when_no_step_works(tmp_path, monkeypatch):
+    monkeypatch.setattr(capture_runtime, "AUTO_EXPOSURE_STARTUP_SETTLE_S", 0.0)
+    runtime = _locked_runtime(tmp_path, exposure_us=250, gain=4.0)
+    camera = _ControlCamera(runtime, scene_per_signal=0.0001)
+    runtime._camera = camera
+    camera.add_frame(250, 4.0)
+
+    runtime.request_exposure_recalibration()
+    runtime._recalibration_thread.join(timeout=5.0)
+
+    status = runtime.auto_exposure_status()
+    assert status["status"] == "lighting_required"
+    assert status["analysis_eligible"] is False
+
+
+def test_stop_during_recalibration_releases_the_reconfigure_lock(tmp_path, monkeypatch):
+    runtime = _locked_runtime(tmp_path)
+    runtime._camera = _ControlCamera(runtime, scene_per_signal=0.0)
+    loop_started = threading.Event()
+
+    def loop_until_stopped():
+        loop_started.set()
+        runtime._auto_exposure_stop.wait(timeout=2.0)
+
+    monkeypatch.setattr(runtime, "_auto_exposure_loop", loop_until_stopped)
+    runtime.request_exposure_recalibration()
+    assert loop_started.wait(timeout=1.0)
+
+    runtime._running = False
+    runtime._auto_exposure_stop.set()
+    runtime._recalibration_thread.join(timeout=2.0)
+
+    assert not runtime._recalibration_thread.is_alive()
+    assert runtime._reconfigure_lock.acquire(blocking=False)
+    runtime._reconfigure_lock.release()
+
+
+@pytest.mark.parametrize(
+    ("running", "auto_exposure", "message"),
+    [
+        (False, True, "not running"),
+        (True, False, "automatic exposure is disabled"),
+    ],
+)
+def test_recalibration_rejects_unavailable_camera(tmp_path, running, auto_exposure, message):
+    runtime = CameraCaptureRuntime(
+        output_dir=tmp_path,
+        settings=CameraCaptureSettings(auto_exposure=auto_exposure),
+    )
+    runtime._running = running
+    runtime._camera = object() if running else None
+
+    with pytest.raises(RuntimeError, match=message):
+        runtime.request_exposure_recalibration()
+
+
+def test_recalibration_waits_for_a_sensor_window_restart(tmp_path):
+    runtime = _locked_runtime(tmp_path)
+    runtime._camera = _ControlCamera(runtime, scene_per_signal=0.0)
+
+    with runtime._reconfigure_lock:
+        with pytest.raises(RuntimeError, match="already recalibrating or restarting"):
+            runtime.request_exposure_recalibration()

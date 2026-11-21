@@ -560,3 +560,24 @@
   width: 3px;
   transform: translateX(-50%);
 }
+
+.camera-settings__recalibrate {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid rgba(74, 222, 128, 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(74, 222, 128, 0.09);
+  color: var(--color-success);
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.camera-settings__recalibrate:disabled {
+  border-color: rgba(245, 240, 230, 0.08);
+  background: rgba(245, 240, 230, 0.025);
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.55;
+}

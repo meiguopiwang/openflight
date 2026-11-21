@@ -257,6 +257,7 @@ def test_start_kiosk_script_has_valid_shell_syntax():
         "scripts/start-kiosk.sh",
         "scripts/ensure-kiosk-ui.sh",
         "scripts/kiosk-browser.sh",
+        "scripts/wait-for-server.sh",
     ):
         subprocess.run(
             ["bash", "-n", relative],
@@ -286,6 +287,7 @@ def test_kiosk_shell_scripts_use_unix_newlines():
         "scripts/ensure-kiosk-ui.sh",
         "scripts/kiosk-browser.sh",
         "scripts/require-node.sh",
+        "scripts/wait-for-server.sh",
     ):
         data = (REPO_ROOT / relative).read_bytes()
         assert b"\r" not in data, (
@@ -776,3 +778,183 @@ def test_startup_failure_prints_the_recovery_hint_to_the_terminal():
     ]
 
     assert re.search(r'error ".*\$recovery"', failure_fn), failure_fn
+
+
+def _run_wait_for_server(
+    tmp_path: Path,
+    *,
+    ready_after_attempts: int | None,
+    server_alive: bool = True,
+    timeout_s: str | None = None,
+    env_timeout_s: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], int, int]:
+    """Run wait_for_server with stub curl/sleep; returns (result, curls, sleeps).
+
+    The stub sleep returns instantly, so a 30 s budget runs in milliseconds and
+    the attempt counts show how long the real loop would have waited.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl_log = tmp_path / "curl-calls"
+    sleep_log = tmp_path / "sleep-calls"
+    ready_check = (
+        "exit 7"
+        if ready_after_attempts is None
+        else f'[ "$(wc -l < {_bash_path(curl_log)})" -ge {ready_after_attempts} ] || exit 7'
+    )
+    _write_executable(
+        bin_dir / "curl",
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                f"printf '%s\\n' \"$*\" >> {_bash_path(curl_log)}",
+                ready_check,
+                "exit 0",
+                "",
+            ]
+        ),
+    )
+    _write_executable(
+        bin_dir / "sleep",
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$1\" >> {_bash_path(sleep_log)}\n",
+    )
+
+    timeout_arg = f" {shlex.quote(timeout_s)}" if timeout_s is not None else ""
+    harness = tmp_path / "run-wait.sh"
+    _write_executable(
+        harness,
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -eo pipefail",
+                'export PATH="$1:$PATH"',
+                "log() { printf 'LOG %s\\n' \"$1\"; }",
+                "# shellcheck source=/dev/null",
+                f"source {_bash_path(REPO_ROOT / 'scripts/wait-for-server.sh')}",
+                'if [ "$2" = alive ]; then pid=$$; else /usr/bin/env true & pid=$!; wait $pid; fi',
+                f'if wait_for_server http://localhost:8080 "$pid"{timeout_arg}; then',
+                "  printf 'READY\\n'",
+                "else",
+                "  printf 'NOT_READY\\n'",
+                "fi",
+                "",
+            ]
+        ),
+    )
+
+    env = dict(os.environ)
+    env.pop("OPENFLIGHT_SERVER_START_TIMEOUT_S", None)
+    if env_timeout_s is not None:
+        env["OPENFLIGHT_SERVER_START_TIMEOUT_S"] = env_timeout_s
+    result = subprocess.run(
+        [
+            "bash",
+            _bash_path(harness),
+            _bash_path(bin_dir),
+            "alive" if server_alive else "dead",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    def _count(path: Path) -> int:
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    return result, _count(curl_log), _count(sleep_log)
+
+
+def test_slow_cold_boot_server_is_not_torn_down_after_15_seconds(tmp_path):
+    """A Pi 5 cold boot took 14 s against a 15 s cap; slower boots showed "timed out".
+
+    Ready on the 41st poll is ~20 s of 0.5 s polls — past the old cap, well inside 30 s.
+    """
+    result, curls, sleeps = _run_wait_for_server(tmp_path, ready_after_attempts=41)
+
+    assert "READY" in result.stdout.splitlines(), result.stdout + result.stderr
+    assert curls == 41
+    assert sleeps == 40
+
+
+def test_server_ready_on_first_poll_does_not_sleep(tmp_path):
+    result, curls, sleeps = _run_wait_for_server(tmp_path, ready_after_attempts=1)
+
+    assert "READY" in result.stdout.splitlines(), result.stdout + result.stderr
+    assert (curls, sleeps) == (1, 0)
+
+
+def test_server_readiness_logs_how_long_startup_took(tmp_path):
+    result, _, _ = _run_wait_for_server(tmp_path, ready_after_attempts=29)
+
+    assert "LOG Server ready after ~14s" in result.stdout.splitlines(), result.stdout
+
+
+def test_crashed_server_ends_the_wait_immediately(tmp_path):
+    """The longer budget must not delay the "exited during startup" screen."""
+    result, curls, sleeps = _run_wait_for_server(
+        tmp_path, ready_after_attempts=None, server_alive=False
+    )
+
+    assert "NOT_READY" in result.stdout.splitlines(), result.stdout + result.stderr
+    assert sleeps == 0
+    assert curls <= 2
+
+
+def test_hung_server_gives_up_after_the_default_30_second_budget(tmp_path):
+    result, _, sleeps = _run_wait_for_server(tmp_path, ready_after_attempts=None)
+
+    assert "NOT_READY" in result.stdout.splitlines(), result.stdout + result.stderr
+    assert sleeps == 60
+
+
+def test_server_start_budget_can_be_overridden_by_argument_and_env(tmp_path):
+    (tmp_path / "arg").mkdir()
+    (tmp_path / "env").mkdir()
+
+    _, _, arg_sleeps = _run_wait_for_server(
+        tmp_path / "arg", ready_after_attempts=None, timeout_s="3"
+    )
+    _, _, env_sleeps = _run_wait_for_server(
+        tmp_path / "env", ready_after_attempts=None, env_timeout_s="5"
+    )
+
+    assert arg_sleeps == 6
+    assert env_sleeps == 10
+
+
+@pytest.mark.parametrize("bad_timeout", ["0", "-5", "abc", "1.5", ""])
+def test_invalid_server_start_budget_falls_back_to_the_default(tmp_path, bad_timeout):
+    result, _, sleeps = _run_wait_for_server(
+        tmp_path, ready_after_attempts=None, env_timeout_s=bad_timeout
+    )
+
+    assert sleeps == 60, result.stdout + result.stderr
+
+
+def test_server_poll_has_a_per_request_timeout(tmp_path):
+    """A server that accepts but never answers must not stall a single poll forever."""
+    _run_wait_for_server(tmp_path, ready_after_attempts=1)
+
+    args = shlex.split((tmp_path / "curl-calls").read_text().splitlines()[0])
+    assert "--max-time" in args or "-m" in args
+
+
+def test_server_wait_counts_polls_instead_of_reading_the_clock():
+    """The Pi has no RTC: NTP jumped the clock 6 minutes forward mid-startup.
+
+    A wall-clock deadline ($SECONDS, date +%s) would expire instantly on that jump.
+    """
+    helper = (REPO_ROOT / "scripts/wait-for-server.sh").read_text(encoding="utf-8")
+
+    assert "SECONDS" not in helper
+    assert "date +%s" not in helper
+
+
+def test_start_kiosk_uses_the_shared_server_wait():
+    script = _script()
+
+    assert 'source "$SCRIPT_DIR/wait-for-server.sh"' in script
+    assert 'wait_for_server "http://$HOST:$WEB_PORT" "$SERVER_PID"' in script
+    assert "for _ in {1..30}" not in script

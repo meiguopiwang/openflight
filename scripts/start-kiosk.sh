@@ -27,6 +27,8 @@ error() { printf '[OpenFlight] ERROR: %s\n' "$1" >&2; }
 
 # shellcheck source=kiosk-browser.sh
 source "$SCRIPT_DIR/kiosk-browser.sh"
+# shellcheck source=wait-for-server.sh
+source "$SCRIPT_DIR/wait-for-server.sh"
 
 require_value() {
     if [ "$#" -lt 2 ]; then
@@ -402,12 +404,7 @@ uv run "${UV_RUN_ARGS[@]}" "${SERVER_CMD[@]}" &
 SERVER_PID=$!
 
 log "Waiting for server to start..."
-for _ in {1..30}; do
-    curl -fsS "http://$HOST:$WEB_PORT" >/dev/null 2>&1 && break
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-    sleep 0.5
-done
-if ! curl -fsS "http://$HOST:$WEB_PORT" >/dev/null 2>&1; then
+if ! wait_for_server "http://$HOST:$WEB_PORT" "$SERVER_PID"; then
     if kill -0 "$SERVER_PID" 2>/dev/null; then
         show_startup_failure \
             "server" \

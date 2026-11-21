@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
@@ -41,6 +41,14 @@ from .clubs.physics import (
     SHOT_SIMULATION_DEFAULTS,
     get_club_physics,
     get_club_simulation_profile,
+)
+from .inclinometer.calibration import (
+    InclinometerCalibrationError,
+    LevelCalibration,
+    level_calibration_from_reading,
+    load_level_calibration,
+    save_level_calibration,
+    undo_level_calibration,
 )
 from .launch_monitor import SPIN_CONFIDENCE_HIGH, SPIN_CONFIDENCE_RELIABLE, Shot, summarize_shots
 from .ops243 import (
@@ -162,6 +170,21 @@ _iwr6843_calibration_lock = threading.Lock()
 # Optional LIS3DH enclosure orientation used to compensate TI mount tilt.
 inclinometer_service = None
 inclinometer_runtime_config: dict = {"enabled": False}
+INCLINOMETER_CALIBRATION_PATH = (
+    Path.home() / ".config" / "openflight" / "inclinometer_calibration.json"
+)
+_inclinometer_calibration_lock = threading.Lock()
+
+
+class InclinometerOffsets(NamedTuple):
+    """LIS3DH zero offsets in force and where each came from."""
+
+    zero_offset_deg: float
+    roll_zero_offset_deg: float
+    pitch_source: str  # "command_line" | "saved" | "default"
+    roll_source: str
+    saved: LevelCalibration | None
+
 
 # Ballistic model toggle. Shot carry comes from the physics simulator whenever
 # a vertical launch angle is available. Operators can explicitly disable it;
@@ -1524,10 +1547,49 @@ def _iwr6843_startup_recovery(error: object) -> str:
     return "Check the TI radar USB and power connections, then relaunch OpenFlight."
 
 
-def init_inclinometer(*, zero_offset_deg: float, bus_number: int = 1, address: int = 0x18) -> bool:
+def _resolve_inclinometer_offsets(
+    *, explicit_pitch: float | None, explicit_roll: float | None
+) -> InclinometerOffsets:
+    """Pick each axis's zero offset: explicit flag, then saved calibration, then 0.
+
+    Same precedence as the phone orientation calibration, applied per axis.
+    """
+    try:
+        saved = load_level_calibration(INCLINOMETER_CALIBRATION_PATH)
+    except (OSError, InclinometerCalibrationError) as error:
+        logger.warning("[SERVER] Ignoring invalid saved inclinometer calibration: %s", error)
+        saved = None
+
+    def pick(explicit: float | None, saved_value: float | None) -> tuple[float, str]:
+        if explicit is not None:
+            return float(explicit), "command_line"
+        if saved_value is not None:
+            return saved_value, "saved"
+        return 0.0, "default"
+
+    pitch, pitch_source = pick(explicit_pitch, saved.zero_offset_deg if saved else None)
+    roll, roll_source = pick(explicit_roll, saved.roll_zero_offset_deg if saved else None)
+    return InclinometerOffsets(pitch, roll, pitch_source, roll_source, saved)
+
+
+def init_inclinometer(
+    *,
+    offsets: InclinometerOffsets,
+    bus_number: int = 1,
+    address: int = 0x18,
+) -> bool:
     """Start the optional LIS3DH service without risking radar availability."""
     global inclinometer_service  # pylint: disable=global-statement
     global inclinometer_runtime_config  # pylint: disable=global-statement
+
+    zero_offset_deg = offsets.zero_offset_deg
+    roll_zero_offset_deg = offsets.roll_zero_offset_deg
+    offset_record = {
+        "zero_offset_deg": zero_offset_deg,
+        "roll_zero_offset_deg": roll_zero_offset_deg,
+        "offset_sources": {"pitch": offsets.pitch_source, "roll": offsets.roll_source},
+        "level_calibration": offsets.saved.to_dict() if offsets.saved else None,
+    }
 
     service = None
     try:
@@ -1536,6 +1598,7 @@ def init_inclinometer(*, zero_offset_deg: float, bus_number: int = 1, address: i
         service = InclinometerService(
             LIS3DH(bus_number=bus_number, address=address),
             zero_offset_deg=zero_offset_deg,
+            roll_zero_offset_deg=roll_zero_offset_deg,
         )
         service.start()
         startup = service.wait_for_stable(timeout_s=2.0)
@@ -1546,9 +1609,14 @@ def init_inclinometer(*, zero_offset_deg: float, bus_number: int = 1, address: i
             "i2c_bus": bus_number,
             "i2c_address": f"0x{address:02x}",
             "sample_hz": service.sample_hz,
-            "zero_offset_deg": zero_offset_deg,
+            **offset_record,
             "startup": startup.to_dict(),
         }
+        print(
+            "Inclinometer zero offsets: "
+            f"pitch {zero_offset_deg:+.3f}deg ({offsets.pitch_source}), "
+            f"roll {roll_zero_offset_deg:+.3f}deg ({offsets.roll_source})"
+        )
         if startup.snapshot is None:
             logger.warning(
                 "[SERVER] LIS3DH initialized but has no stable startup reading (%s)",
@@ -1564,8 +1632,7 @@ def init_inclinometer(*, zero_offset_deg: float, bus_number: int = 1, address: i
             f"calibrated {snapshot.calibrated_pitch_deg:+.2f}deg)"
         )
         if iwr6843_runtime is not None:
-            configured_tilt = math.degrees(iwr6843_runtime.calibration.tilt_rad)
-            effective_tilt = configured_tilt + snapshot.calibrated_pitch_deg
+            configured_tilt, effective_tilt = _iwr_tilt_for_pitch(snapshot.calibrated_pitch_deg)
             print(
                 f"IWR6843 tilt: configured {configured_tilt:.2f}deg, "
                 f"effective {effective_tilt:.2f}deg"
@@ -1591,7 +1658,7 @@ def init_inclinometer(*, zero_offset_deg: float, bus_number: int = 1, address: i
             "sensor": "lis3dh",
             "i2c_bus": bus_number,
             "i2c_address": f"0x{address:02x}",
-            "zero_offset_deg": zero_offset_deg,
+            **offset_record,
             "error": str(error),
         }
         return False
@@ -1685,6 +1752,213 @@ def camera_capture_exposure_quality():
     quality = camera_capture_runtime.exposure_quality()
     quality["auto_exposure"] = camera_capture_runtime.auto_exposure_status()
     return jsonify(quality)
+
+
+@app.route("/api/inclinometer/level")
+def inclinometer_level():
+    """Current enclosure orientation for the Camera tab's setup readout.
+
+    Angles are withheld unless the sensor window is stationary, matching what
+    a shot taken right now would use.
+    """
+    if inclinometer_service is None:
+        return jsonify({"enabled": False, "status": "unavailable"}), 404
+    selection = inclinometer_service.snapshot_for_impact(time.time())
+    snapshot = selection.snapshot
+    configured_tilt, radar_tilt = _iwr_tilt_for_pitch(
+        snapshot.calibrated_pitch_deg if snapshot is not None else None
+    )
+    return jsonify(
+        {
+            "enabled": True,
+            "status": selection.status,
+            "age_s": round(selection.age_s, 3) if selection.age_s is not None else None,
+            "pitch_deg": round(snapshot.calibrated_pitch_deg, 2) if snapshot else None,
+            "roll_deg": round(snapshot.calibrated_roll_deg, 2) if snapshot else None,
+            "configured_iwr_tilt_deg": (
+                round(configured_tilt, 2) if configured_tilt is not None else None
+            ),
+            "radar_tilt_deg": round(radar_tilt, 2) if radar_tilt is not None else None,
+            "error": inclinometer_service.last_error,
+            "calibration": _inclinometer_calibration_status(),
+        }
+    )
+
+
+_LEVEL_READING_MESSAGES = {
+    "moving": "The unit moved. Keep it still for 3 seconds, then try again.",
+    "settling": "Still collecting readings. Keep the unit still and try again in a few seconds.",
+    "sensor_error": "The tilt sensor reported an error. Check its cable, then try again.",
+}
+
+
+def _inclinometer_offsets_locked_by_flags() -> bool:
+    sources = inclinometer_runtime_config.get("offset_sources") or {}
+    return "command_line" in sources.values()
+
+
+def _inclinometer_calibration_status() -> dict:
+    """Where the offsets came from and which Level dialog actions are allowed."""
+    sources = inclinometer_runtime_config.get("offset_sources") or {}
+    saved = inclinometer_runtime_config.get("level_calibration")
+    can_calibrate = not _inclinometer_offsets_locked_by_flags()
+    return {
+        "pitch_source": sources.get("pitch"),
+        "roll_source": sources.get("roll"),
+        "calibrated_at": saved.get("calibrated_at") if saved else None,
+        "can_calibrate": can_calibrate,
+        "can_undo": bool(
+            can_calibrate
+            and saved
+            and saved.get("previous_zero_offset_deg") is not None
+            and saved.get("previous_roll_zero_offset_deg") is not None
+        ),
+    }
+
+
+def _locked_by_flags_response():
+    return (
+        jsonify(
+            {
+                "error": "command_line",
+                "message": (
+                    "The zero offsets are set by --inclinometer-zero-offset or "
+                    "--inclinometer-roll-zero-offset in the launch command. Remove them "
+                    "to calibrate from the screen."
+                ),
+            }
+        ),
+        409,
+    )
+
+
+def _offset_pair(zero_offset_deg: float, roll_zero_offset_deg: float) -> dict:
+    return {
+        "zero_offset_deg": round(zero_offset_deg, 3),
+        "roll_zero_offset_deg": round(roll_zero_offset_deg, 3),
+    }
+
+
+def _apply_level_calibration(calibration: LevelCalibration, *, source: str) -> None:
+    """Save first, then apply: a calibration that cannot persist is never used."""
+    save_level_calibration(calibration, INCLINOMETER_CALIBRATION_PATH)
+    inclinometer_service.set_zero_offsets(
+        zero_offset_deg=calibration.zero_offset_deg,
+        roll_zero_offset_deg=calibration.roll_zero_offset_deg,
+    )
+    record = calibration.to_dict()
+    inclinometer_runtime_config.update(
+        {
+            "zero_offset_deg": calibration.zero_offset_deg,
+            "roll_zero_offset_deg": calibration.roll_zero_offset_deg,
+            "offset_sources": {"pitch": "saved", "roll": "saved"},
+            "level_calibration": record,
+        }
+    )
+    logger.info(
+        "[SERVER] Inclinometer %s: pitch offset %+.3fdeg, roll offset %+.3fdeg",
+        source.replace("_", " "),
+        calibration.zero_offset_deg,
+        calibration.roll_zero_offset_deg,
+    )
+    session_log = get_session_logger()
+    if session_log is not None:
+        session_log.log_config_change({"inclinometer_calibration": record}, source=source)
+
+
+def _calibration_save_failed_response(error: OSError):
+    logger.warning("[SERVER] Could not save inclinometer calibration: %s", error)
+    return jsonify({"error": "save_failed", "message": f"Could not save calibration: {error}"}), 500
+
+
+@app.route("/api/inclinometer/level-calibration", methods=["POST"])
+def inclinometer_level_calibration():
+    """Zero pitch and roll with the unit standing still on a level floor.
+
+    ``{"apply": false}`` previews the new offsets; ``{"apply": true}`` saves
+    and applies them. Both recompute from the latest still window.
+    """
+    if inclinometer_service is None:
+        return jsonify({"error": "unavailable", "message": "No inclinometer is enabled"}), 404
+    body = request.get_json(silent=True) or {}
+    apply = body.get("apply")
+    if not isinstance(apply, bool):
+        return jsonify({"error": "bad_request", "message": "apply must be true or false"}), 400
+    if _inclinometer_offsets_locked_by_flags():
+        return _locked_by_flags_response()
+
+    with _inclinometer_calibration_lock:
+        reading, status = inclinometer_service.level_reading()
+        if reading is None:
+            return jsonify({"error": status, "message": _LEVEL_READING_MESSAGES[status]}), 409
+        current_pitch = inclinometer_service.zero_offset_deg
+        current_roll = inclinometer_service.roll_zero_offset_deg
+        try:
+            calibration = level_calibration_from_reading(
+                reading,
+                previous_zero_offset_deg=current_pitch,
+                previous_roll_zero_offset_deg=current_roll,
+                calibrated_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        except InclinometerCalibrationError as error:
+            return jsonify({"error": "out_of_range", "message": str(error)}), 422
+        if apply:
+            try:
+                _apply_level_calibration(calibration, source="level_calibration")
+            except OSError as error:
+                return _calibration_save_failed_response(error)
+
+    return jsonify(
+        {
+            "applied": apply,
+            "current": _offset_pair(current_pitch, current_roll),
+            "proposed": _offset_pair(calibration.zero_offset_deg, calibration.roll_zero_offset_deg),
+            "change": {
+                "pitch_deg": round(calibration.zero_offset_deg - current_pitch, 3),
+                "roll_deg": round(calibration.roll_zero_offset_deg - current_roll, 3),
+            },
+            "reading": {
+                "raw_pitch_deg": round(reading.raw_pitch_deg, 3),
+                "raw_roll_deg": round(reading.raw_roll_deg, 3),
+                "pitch_std_deg": round(reading.pitch_std_deg, 3),
+                "roll_std_deg": round(reading.roll_std_deg, 3),
+                "snapshot_count": reading.snapshot_count,
+            },
+            "calibrated_at": calibration.calibrated_at,
+        }
+    )
+
+
+@app.route("/api/inclinometer/level-calibration/undo", methods=["POST"])
+def inclinometer_level_calibration_undo():
+    """Swap back to the offsets the last calibration replaced."""
+    if inclinometer_service is None:
+        return jsonify({"error": "unavailable", "message": "No inclinometer is enabled"}), 404
+    if _inclinometer_offsets_locked_by_flags():
+        return _locked_by_flags_response()
+
+    with _inclinometer_calibration_lock:
+        try:
+            saved = load_level_calibration(INCLINOMETER_CALIBRATION_PATH)
+            if saved is None:
+                raise InclinometerCalibrationError("nothing to undo: the unit was never calibrated")
+            restored = undo_level_calibration(
+                saved, calibrated_at=datetime.now().isoformat(timespec="seconds")
+            )
+        except (OSError, InclinometerCalibrationError) as error:
+            return jsonify({"error": "nothing_to_undo", "message": str(error)}), 409
+        try:
+            _apply_level_calibration(restored, source="level_calibration_undo")
+        except OSError as error:
+            return _calibration_save_failed_response(error)
+
+    return jsonify(
+        {
+            "applied": True,
+            "current": _offset_pair(restored.zero_offset_deg, restored.roll_zero_offset_deg),
+            "calibrated_at": restored.calibrated_at,
+        }
+    )
 
 
 @app.route("/api/camera/replays/<replay_id>/prepare", methods=["GET", "POST"])
@@ -2830,6 +3104,16 @@ def horizontal_confidence_from(coherence: float | None) -> float:
     return round(min(ANGLE_CONFIDENCE_CEILING, max(0.0, float(coherence))), 3)
 
 
+def _iwr_tilt_for_pitch(calibrated_pitch_deg: float | None) -> tuple[float | None, float | None]:
+    """Configured IWR6843 tilt and that tilt corrected by the enclosure pitch, in degrees."""
+    if iwr6843_runtime is None:
+        return None, None
+    configured_tilt = math.degrees(iwr6843_runtime.calibration.tilt_rad)
+    if calibrated_pitch_deg is None:
+        return configured_tilt, None
+    return configured_tilt, configured_tilt + calibrated_pitch_deg
+
+
 def _snapshot_inclinometer_for_shot(shot: Shot) -> None:
     """Attach the stable pre-impact enclosure orientation used by this shot."""
     if inclinometer_service is None or shot.mode == "mock":
@@ -2841,8 +3125,7 @@ def _snapshot_inclinometer_for_shot(shot: Shot) -> None:
     data["zero_offset_deg"] = inclinometer_runtime_config.get("zero_offset_deg", 0.0)
     snapshot = selection.snapshot
     if snapshot is not None and iwr6843_runtime is not None:
-        configured_tilt = math.degrees(iwr6843_runtime.calibration.tilt_rad)
-        effective_tilt = configured_tilt + snapshot.calibrated_pitch_deg
+        configured_tilt, effective_tilt = _iwr_tilt_for_pitch(snapshot.calibrated_pitch_deg)
         data.update(
             {
                 "applied": True,
@@ -5244,8 +5527,21 @@ def main():
     parser.add_argument(
         "--inclinometer-zero-offset",
         type=float,
-        default=0.0,
-        help="Degrees added to raw LIS3DH pitch (default: 0)",
+        default=None,
+        help=(
+            "Degrees added to raw LIS3DH pitch. Overrides the Camera tab level "
+            "calibration (default: saved calibration, else 0)"
+        ),
+    )
+    parser.add_argument(
+        "--inclinometer-roll-zero-offset",
+        type=float,
+        default=None,
+        help=(
+            "Degrees added to raw LIS3DH sideways lean so a level unit reads 0 "
+            "(setup readout only). Overrides the Camera tab level calibration "
+            "(default: saved calibration, else 0)"
+        ),
     )
     parser.add_argument(
         "--iwr6843-port", default=None, help="TI serial port (auto-detect by default)"
@@ -5467,6 +5763,14 @@ def main():
         parser.error("--iwr6843 and horizontal --kld7 cannot both own club path")
     if args.inclinometer and not args.iwr6843:
         parser.error("--inclinometer requires --iwr6843")
+    inclinometer_offsets = (
+        _resolve_inclinometer_offsets(
+            explicit_pitch=args.inclinometer_zero_offset,
+            explicit_roll=args.inclinometer_roll_zero_offset,
+        )
+        if args.inclinometer
+        else None
+    )
     if args.iwr6843 and args.mock:
         parser.error("--iwr6843 cannot be used with --mock")
     if args.camera_shot_analysis and args.mock:
@@ -5696,7 +6000,7 @@ def main():
 
     if args.inclinometer:
         startup_status.start("inclinometer", "Connecting inclinometer")
-        if not init_inclinometer(zero_offset_deg=args.inclinometer_zero_offset):
+        if not init_inclinometer(offsets=inclinometer_offsets):
             print("WARNING: Inclinometer unavailable; continuing with configured IWR6843 tilt")
             startup_status.skip("inclinometer", "Inclinometer unavailable; continuing")
         else:

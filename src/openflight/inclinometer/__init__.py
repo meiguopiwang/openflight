@@ -1,7 +1,7 @@
 """Enclosure orientation sensing for radar tilt compensation."""
 
 from .lis3dh import LIS3DH, LIS3DHIdentityError
-from .models import AccelerationSample, OrientationSnapshot, SnapshotSelection
+from .models import AccelerationSample, LevelReading, OrientationSnapshot, SnapshotSelection
 from .service import InclinometerService
 
 __all__ = [
@@ -9,6 +9,7 @@ __all__ = [
     "InclinometerService",
     "LIS3DH",
     "LIS3DHIdentityError",
+    "LevelReading",
     "OrientationSnapshot",
     "SnapshotSelection",
 ]

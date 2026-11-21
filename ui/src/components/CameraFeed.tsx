@@ -9,6 +9,7 @@ import {
 } from '../utils/cameraExposure';
 import { verticalViewTargets } from '../utils/cameraView';
 import { getServerOrigin } from '../utils/serverOrigin';
+import { LevelReadout } from './LevelReadout';
 import './CameraFeed.css';
 
 interface CameraFeedProps {
@@ -317,6 +318,7 @@ export function CameraFeed({
             <h2 className="camera-feed__title">Camera alignment</h2>
           </div>
           <div className="camera-feed__header-status">
+            <LevelReadout />
             <span
               className={`camera-feed__exposure-quality camera-feed__exposure-quality--${exposureQuality?.status ?? 'checking'}`}
               title={exposureQuality?.message ?? 'Analyzing the impact area'}
@@ -384,6 +386,7 @@ export function CameraFeed({
       <div className="camera-feed__message">
         <h3>Camera Not Available</h3>
         <p>Start the server with --camera-capture to enable previews.</p>
+        <LevelReadout />
       </div>
     </div>
   );

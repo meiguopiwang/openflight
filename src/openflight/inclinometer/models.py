@@ -28,16 +28,35 @@ class OrientationSnapshot:
     calibrated_pitch_deg: float
     pitch_std_deg: float
     sample_count: int
+    raw_roll_deg: float
+    calibrated_roll_deg: float
 
     def to_dict(self) -> dict:
         """Return JSON-safe rounded diagnostic fields."""
         data = asdict(self)
         for key in ("x_g", "y_g", "z_g", "gravity_g"):
             data[key] = round(data[key], 4)
-        for key in ("raw_pitch_deg", "calibrated_pitch_deg", "pitch_std_deg"):
+        for key in (
+            "raw_pitch_deg",
+            "calibrated_pitch_deg",
+            "pitch_std_deg",
+            "raw_roll_deg",
+            "calibrated_roll_deg",
+        ):
             data[key] = round(data[key], 3)
         data["stable"] = True
         return data
+
+
+@dataclass(frozen=True)
+class LevelReading:
+    """Raw enclosure angles averaged over a still window, for level calibration."""
+
+    raw_pitch_deg: float
+    raw_roll_deg: float
+    pitch_std_deg: float
+    roll_std_deg: float
+    snapshot_count: int
 
 
 @dataclass(frozen=True)

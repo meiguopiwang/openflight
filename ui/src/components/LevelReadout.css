@@ -1,0 +1,53 @@
+/* Live tilt pill in the Camera tab header; tap to open the level dialog. */
+.level-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: var(--radius);
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--color-text-muted);
+  min-height: 1.75rem;
+  margin: 0;
+  font: inherit;
+  font-size: 0.67rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.level-readout:active {
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.level-readout__label {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.level-readout__value strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.level-readout__lean--ok {
+  color: var(--color-success);
+}
+
+.level-readout__lean--warn {
+  color: var(--color-warning);
+}
+
+.level-readout--settling .level-readout__value {
+  opacity: 0.55;
+}
+
+.level-readout__message {
+  color: var(--color-warning);
+}
+
+.level-readout--waiting .level-readout__message {
+  font-weight: 600;
+}

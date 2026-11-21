@@ -1,0 +1,136 @@
+/* Level dialog opened from the Camera tab's Level pill. Fixed so it covers the
+   whole kiosk regardless of which header it was opened from. */
+.level-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.level-dialog__scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: color-mix(in srgb, var(--color-bg) 70%, transparent);
+  cursor: pointer;
+}
+
+.level-dialog__box {
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  width: min(30rem, calc(100% - 32px));
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  /* Opened from inside other panels; do not inherit their alignment. */
+  text-align: left;
+}
+
+.level-dialog__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.level-dialog__title {
+  font-size: 1.125rem;
+  font-weight: 700;
+}
+
+.level-dialog__source {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
+.level-dialog__angles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 1.5rem;
+  row-gap: 0.25rem;
+}
+
+.level-dialog__angles strong {
+  font-size: 1.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.level-dialog__angles--settling strong {
+  opacity: 0.55;
+}
+
+.level-dialog__angle-label {
+  margin-right: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.level-dialog__angles .level-dialog__hint {
+  flex-basis: 100%;
+}
+
+.level-dialog__hint,
+.level-dialog__detail {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.35;
+  color: var(--color-text-muted);
+}
+
+.level-dialog__detail--warn {
+  color: var(--color-warning);
+}
+
+.level-dialog__notice {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-success);
+}
+
+.level-dialog__change {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0;
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.level-dialog__change dt {
+  font-weight: 700;
+  color: var(--color-text-muted);
+}
+
+.level-dialog__change dd {
+  margin: 0;
+}
+
+.level-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 0.25rem;
+}
+
+/* Buttons never shrink below their label (panel-action is nowrap); a long
+   label such as "Undo last calibration" wraps onto its own row instead. */
+.level-dialog__actions .panel-action {
+  flex: 1 0 auto;
+  justify-content: center;
+}

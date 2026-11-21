@@ -91,10 +91,13 @@ scripts/battery/geekworm/setup.sh --verify
 
 The script is safe to rerun. It performs these changes:
 
-1. Installs `i2c-tools` and `upower` when missing.
+1. Installs `i2c-tools`, `upower`, and `device-tree-compiler` when missing.
 2. Loads `i2c-dev` at boot for I2C diagnostics.
 3. Enables I2C in `/boot/firmware/config.txt`.
-4. Adds the native MAX17040 battery and active-high GPIO6 charger overlays.
+4. Compiles OpenFlight's fuel-gauge overlay into
+   `/boot/firmware/overlays/openflight-max17043.dtbo`, then adds it and the
+   active-high GPIO6 charger overlay. An older `dtoverlay=i2c-sensor,max17040`
+   line is replaced in place (see [Why Not `i2c-sensor,max17040`](#why-not-i2c-sensormax17040)).
 5. Sets `PSU_MAX_CURRENT=5000` in the Pi 5 bootloader EEPROM so Raspberry Pi OS
    recognizes the UPS as a 5A-capable supply.
 6. Sets `POWER_OFF_ON_HALT=1` so the UPS can remove power after Linux halts.
@@ -150,13 +153,36 @@ The setup script adds these settings under an `[all]` section when absent:
 
 ```ini
 dtparam=i2c_arm=on
-dtoverlay=i2c-sensor,max17040
+dtoverlay=openflight-max17043
 dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains
 ```
 
-The first overlay binds Linux's `max17040_battery` driver to I2C address
-`0x36`. The second binds `gpio_charger` to GPIO6, where low means adapter
+The first overlay binds Linux's `max17040_battery` driver to the MAX17043 fuel
+gauge at I2C address `0x36`. Its source is
+`scripts/battery/geekworm/openflight-max17043.dts`. The second binds `gpio_charger` to GPIO6, where low means adapter
 failure and high means external power is good.
+
+### Why Not `i2c-sensor,max17040`
+
+Raspberry Pi's stock `i2c-sensor,max17040` overlay declares the gauge as a
+MAX17040. For that model, the kernel driver sends a reset command every time it
+loads, so each boot discards the charge the gauge has learned and restarts its
+estimate from the battery voltage at that moment. Booting while charging
+raises the voltage and the percentage reads high (for example 95% on cells
+that were at 25% a minute earlier); booting on battery under load reads low.
+After unplugging, the percentage then falls quickly as the gauge corrects
+itself, and the Pi can shut down while still showing a healthy percentage.
+
+The driver does not reset a gauge declared as MAX17043, which is the chip on
+the X1202/X1206, so the learned charge survives Pi reboots for as long as the
+cells stay installed. Removing the cells still restarts the estimate; give it
+a full charge and discharge before trusting the percentage again.
+
+Check the active binding with:
+
+```bash
+cat /sys/class/power_supply/battery/device/of_node/compatible   # maxim,max17043
+```
 
 After reboot, the expected native devices are:
 

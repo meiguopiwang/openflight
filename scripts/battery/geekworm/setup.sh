@@ -8,6 +8,9 @@ BATTERY_SCRIPT_DIR="$(dirname "$SCRIPT_DIR")"
 BOOT_CONFIG="${OPENFLIGHT_GEEKWORM_BOOT_CONFIG:-/boot/firmware/config.txt}"
 MODULES_CONFIG="${OPENFLIGHT_GEEKWORM_MODULES_CONFIG:-/etc/modules-load.d/openflight-geekworm.conf}"
 POWER_SUPPLY_ROOT="${OPENFLIGHT_GEEKWORM_POWER_SUPPLY_ROOT:-/sys/class/power_supply}"
+OVERLAYS_DIR="${OPENFLIGHT_GEEKWORM_OVERLAYS_DIR:-/boot/firmware/overlays}"
+BATTERY_OVERLAY_NAME="openflight-max17043"
+BATTERY_OVERLAY_SOURCE="$SCRIPT_DIR/$BATTERY_OVERLAY_NAME.dts"
 PI_MODEL_PATH="${OPENFLIGHT_GEEKWORM_PI_MODEL_PATH:-/proc/device-tree/model}"
 PANEL_PACKAGE="$BATTERY_SCRIPT_DIR/packages/wfplug-batt_1.3+openflight4_arm64.deb"
 PANEL_PACKAGE_VERSION="1.3+openflight4"
@@ -15,7 +18,9 @@ PANEL_PACKAGE_SHA256="55db8a460f99758f2dac9d509b29907e0e268ee88bbff4edb6adcee312
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 I2C_LINE="dtparam=i2c_arm=on"
-BATTERY_OVERLAY="dtoverlay=i2c-sensor,max17040"
+BATTERY_OVERLAY="dtoverlay=$BATTERY_OVERLAY_NAME"
+# Older setups used this; the kernel resets a MAX17040 gauge on every boot.
+LEGACY_BATTERY_OVERLAY="dtoverlay=i2c-sensor,max17040"
 CHARGER_OVERLAY="dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains"
 
 VERIFY_ONLY=false
@@ -91,6 +96,8 @@ update_boot_config() {
         die "A different gpio-charger overlay already exists: $conflicting_gpio"
     fi
 
+    replace_legacy_battery_overlay "$config_path"
+
     grep -Fqx "$I2C_LINE" "$config_path" || missing+=("$I2C_LINE")
     grep -Fqx "$BATTERY_OVERLAY" "$config_path" || missing+=("$BATTERY_OVERLAY")
     grep -Fqx "$CHARGER_OVERLAY" "$config_path" || missing+=("$CHARGER_OVERLAY")
@@ -104,6 +111,35 @@ update_boot_config() {
         printf '# OpenFlight Geekworm X1202/X1206 telemetry\n'
         printf '%s\n' "${missing[@]}"
     } >> "$config_path"
+}
+
+# Swap the first legacy battery overlay for ours in place, keeping its
+# section, and drop any further copies.
+replace_legacy_battery_overlay() {
+    local config_path="$1"
+    local updated
+
+    grep -Fqx "$LEGACY_BATTERY_OVERLAY" "$config_path" || return 0
+
+    updated="$(mktemp)"
+    awk -v legacy="$LEGACY_BATTERY_OVERLAY" -v current="$BATTERY_OVERLAY" '
+        BEGIN {
+            while ((getline line < ARGV[1]) > 0)
+                if (line == current)
+                    present = 1
+            close(ARGV[1])
+        }
+        $0 == legacy {
+            if (!present) {
+                print current
+                present = 1
+            }
+            next
+        }
+        { print }
+    ' "$config_path" > "$updated"
+    cat "$updated" > "$config_path"
+    rm -f "$updated"
 }
 
 set_key_value() {
@@ -142,7 +178,7 @@ install_required_packages() {
     local -a missing=()
     local package
 
-    for package in i2c-tools upower; do
+    for package in i2c-tools upower device-tree-compiler; do
         dpkg-query -W "$package" >/dev/null 2>&1 || missing+=("$package")
     done
 
@@ -205,6 +241,30 @@ configure_boot_overlays() {
     fi
 
     rm -f "$current" "$updated"
+}
+
+install_battery_overlay() {
+    local target="$OVERLAYS_DIR/$BATTERY_OVERLAY_NAME.dtbo"
+    local compiled
+
+    [[ -d "$OVERLAYS_DIR" ]] || die "Boot overlays directory not found: $OVERLAYS_DIR"
+    [[ -f "$BATTERY_OVERLAY_SOURCE" ]] || die "Overlay source not found: $BATTERY_OVERLAY_SOURCE"
+    command -v dtc >/dev/null 2>&1 || die "dtc is unavailable; install device-tree-compiler"
+
+    compiled="$(mktemp)"
+    if ! dtc -@ -I dts -O dtb -o "$compiled" "$BATTERY_OVERLAY_SOURCE"; then
+        rm -f "$compiled"
+        die "Could not compile $BATTERY_OVERLAY_SOURCE"
+    fi
+
+    if [[ -f "$target" ]] && cmp -s "$compiled" "$target"; then
+        log "Battery overlay is already installed: $target"
+    else
+        as_root install -m 0644 "$compiled" "$target"
+        log "Installed battery overlay: $target"
+        REBOOT_REQUIRED=true
+    fi
+    rm -f "$compiled"
 }
 
 configure_eeprom() {
@@ -317,6 +377,18 @@ verify_installation() {
         fi
     done
 
+    if grep -Fqx "$LEGACY_BATTERY_OVERLAY" "$BOOT_CONFIG" 2>/dev/null; then
+        warn "Remove $LEGACY_BATTERY_OVERLAY: it resets the fuel gauge on every boot."
+        failures=$((failures + 1))
+    fi
+
+    if [[ -f "$OVERLAYS_DIR/$BATTERY_OVERLAY_NAME.dtbo" ]]; then
+        log "Battery overlay installed: $OVERLAYS_DIR/$BATTERY_OVERLAY_NAME.dtbo"
+    else
+        warn "Missing battery overlay: $OVERLAYS_DIR/$BATTERY_OVERLAY_NAME.dtbo"
+        failures=$((failures + 1))
+    fi
+
     eeprom="$(rpi-eeprom-config 2>/dev/null || true)"
     for line in "PSU_MAX_CURRENT=5000" "POWER_OFF_ON_HALT=1"; do
         if grep -Fqx "$line" <<< "$eeprom"; then
@@ -428,6 +500,7 @@ main() {
     log "Configuring X1202/X1206 native power telemetry."
     install_required_packages
     configure_i2c_module
+    install_battery_overlay
     configure_boot_overlays
     configure_eeprom
     install_panel_package

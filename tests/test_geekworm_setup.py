@@ -6,6 +6,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_SCRIPT = PROJECT_ROOT / "scripts" / "battery" / "geekworm" / "setup.sh"
+BATTERY_OVERLAY_SOURCE = (
+    PROJECT_ROOT / "scripts" / "battery" / "geekworm" / "openflight-max17043.dts"
+)
 PANEL_PACKAGE = (
     PROJECT_ROOT / "scripts" / "battery" / "packages" / "wfplug-batt_1.3+openflight4_arm64.deb"
 )
@@ -50,7 +53,8 @@ def test_boot_configuration_update_is_idempotent(tmp_path):
     assert second.returncode == 0, second.stderr
     assert config.read_text(encoding="ascii") == first_content
     assert first_content.count("dtparam=i2c_arm=on") == 1
-    assert first_content.count("dtoverlay=i2c-sensor,max17040") == 1
+    assert first_content.count("dtoverlay=openflight-max17043") == 1
+    assert "i2c-sensor,max17040" not in first_content
     assert first_content.count("dtoverlay=gpio-charger,gpio=6") == 1
     assert "\n[all]\n# OpenFlight Geekworm" in first_content
 
@@ -60,7 +64,7 @@ def test_boot_configuration_accepts_existing_openflight_settings(tmp_path):
     original = """\
 dtparam=i2c_arm=on
 [all]
-dtoverlay=i2c-sensor,max17040
+dtoverlay=openflight-max17043
 dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains
 """
     config.write_text(original, encoding="ascii")
@@ -69,6 +73,151 @@ dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains
 
     assert result.returncode == 0, result.stderr
     assert config.read_text(encoding="ascii") == original
+
+
+def test_boot_configuration_replaces_the_resetting_max17040_overlay_in_place(tmp_path):
+    # The kernel resets a "maxim,max17040" gauge on every boot, so the charge
+    # estimate restarts from the loaded or charging voltage.
+    config = tmp_path / "config.txt"
+    config.write_text(
+        """\
+dtparam=i2c_arm=on
+[all]
+# OpenFlight Geekworm X1202/X1206 telemetry
+dtoverlay=i2c-sensor,max17040
+dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains
+""",
+        encoding="ascii",
+    )
+
+    first = _run_function("update_boot_config", config)
+    content = config.read_text(encoding="ascii")
+    second = _run_function("update_boot_config", config)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert config.read_text(encoding="ascii") == content
+    assert (
+        content
+        == """\
+dtparam=i2c_arm=on
+[all]
+# OpenFlight Geekworm X1202/X1206 telemetry
+dtoverlay=openflight-max17043
+dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains
+"""
+    )
+
+
+def test_boot_configuration_drops_a_duplicate_max17040_overlay(tmp_path):
+    config = tmp_path / "config.txt"
+    config.write_text(
+        "dtparam=i2c_arm=on\n"
+        "dtoverlay=openflight-max17043\n"
+        "dtoverlay=i2c-sensor,max17040\n"
+        "dtoverlay=gpio-charger,gpio=6,active_low=0,gpio_pull=down,type=mains\n",
+        encoding="ascii",
+    )
+
+    result = _run_function("update_boot_config", config)
+    content = config.read_text(encoding="ascii")
+
+    assert result.returncode == 0, result.stderr
+    assert content.count("dtoverlay=openflight-max17043") == 1
+    assert "i2c-sensor,max17040" not in content
+
+
+def test_boot_configuration_leaves_other_i2c_sensor_overlays_alone(tmp_path):
+    config = tmp_path / "config.txt"
+    config.write_text("dtoverlay=i2c-sensor,bme280\n", encoding="ascii")
+
+    result = _run_function("update_boot_config", config)
+    content = config.read_text(encoding="ascii")
+
+    assert result.returncode == 0, result.stderr
+    assert "dtoverlay=i2c-sensor,bme280\n" in content
+    assert content.count("dtoverlay=openflight-max17043") == 1
+
+
+def test_battery_overlay_source_binds_a_non_resetting_max17043_at_0x36():
+    source = BATTERY_OVERLAY_SOURCE.read_text(encoding="ascii")
+
+    assert "/plugin/;" in source
+    assert "target = <&i2c_arm>;" in source
+    assert 'compatible = "maxim,max17043";' in source
+    assert "reg = <0x36>;" in source
+    assert '"maxim,max17040"' not in source
+
+
+def _fake_dtc(tmp_path: Path) -> Path:
+    """A dtc stand-in that records its arguments and writes the output file."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    dtc = bin_dir / "dtc"
+    dtc.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$@" > "$FAKE_DTC_ARGS"\n'
+        'while (( $# )); do [[ "$1" == -o ]] && out="$2"; shift; done\n'
+        'printf compiled > "$out"\n',
+        encoding="ascii",
+    )
+    dtc.chmod(0o755)
+    return bin_dir
+
+
+def _run_install_overlay(tmp_path: Path, overlays_dir: Path) -> subprocess.CompletedProcess[str]:
+    bin_dir = _fake_dtc(tmp_path)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; as_root() { "$@"; }; install_battery_overlay; '
+            'echo "REBOOT_REQUIRED=$REBOOT_REQUIRED"',
+            "geekworm-test",
+            str(SETUP_SCRIPT),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "FAKE_DTC_ARGS": str(tmp_path / "dtc-args"),
+            "OPENFLIGHT_GEEKWORM_OVERLAYS_DIR": str(overlays_dir),
+        },
+    )
+
+
+def test_install_battery_overlay_compiles_the_source_into_the_overlays_dir(tmp_path):
+    overlays = tmp_path / "overlays"
+    overlays.mkdir()
+
+    result = _run_install_overlay(tmp_path, overlays)
+
+    assert result.returncode == 0, result.stderr
+    assert (overlays / "openflight-max17043.dtbo").read_text() == "compiled"
+    args = (tmp_path / "dtc-args").read_text().split()
+    assert args[:4] == ["-@", "-I", "dts", "-O"]
+    assert str(BATTERY_OVERLAY_SOURCE) in args
+    assert "REBOOT_REQUIRED=true" in result.stdout
+
+
+def test_install_battery_overlay_is_idempotent(tmp_path):
+    overlays = tmp_path / "overlays"
+    overlays.mkdir()
+    _run_install_overlay(tmp_path, overlays)
+
+    result = _run_install_overlay(tmp_path, overlays)
+
+    assert result.returncode == 0, result.stderr
+    assert "already installed" in result.stdout
+    assert "REBOOT_REQUIRED=false" in result.stdout
+
+
+def test_install_battery_overlay_fails_without_an_overlays_dir(tmp_path):
+    result = _run_install_overlay(tmp_path, tmp_path / "missing")
+
+    assert result.returncode != 0
+    assert "overlays directory" in result.stderr
 
 
 def test_boot_configuration_rejects_conflicting_charger_overlay(tmp_path):

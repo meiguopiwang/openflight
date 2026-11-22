@@ -1,0 +1,127 @@
+"""The one mapping from the loaded Calibration to what the board and the
+replay are told (late-flight spec, 2026-09-29)."""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from openflight.iwr6843.board_calibration import BoardCalibration
+from openflight.iwr6843.calibration import Calibration
+from openflight.iwr6843.firmware_replay import ReplayConfig
+
+REFERENCE = "config/iwr6843_calibration_reference.json"
+
+
+def test_identity_is_zero_attitude_and_unit_elements():
+    ident = BoardCalibration.identity()
+    assert ident.cal_args == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert ident.elem_phase_rad == (0.0,) * 8 and ident.elem_gain == (1.0,) * 8
+
+
+def test_from_calibration_maps_tilt_bias_and_elements():
+    cal = Calibration.load(REFERENCE)
+    board = BoardCalibration.from_calibration(cal)
+    assert board.pitch_deg == pytest.approx(math.degrees(cal.tilt_rad))
+    assert (board.yaw_deg, board.roll_deg, board.el_offset_deg) == (0.0, 0.0, 0.0)
+    assert board.az_offset_rad == 0.0
+    assert board.range_bias_m == pytest.approx(cal.range_bias_m)
+    rebuilt = np.exp(-1j * np.array(board.elem_phase_rad)) / np.array(board.elem_gain)
+    assert rebuilt == pytest.approx(cal.elem_correction, rel=1e-9)
+
+
+def test_a_measured_azimuth_offset_reaches_the_board(tmp_path):
+    """The bench azimuth check (azimuth_check.py) writes azimuth_offset_rad
+    into the calibration JSON; without it the offset stays 0."""
+    raw = json.loads(Path(REFERENCE).read_text(encoding="utf-8"))
+    raw["azimuth_offset_rad"] = 0.42
+    path = tmp_path / "cal.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    board = BoardCalibration.from_file(path)
+    assert board.az_offset_rad == pytest.approx(0.42)
+    assert board.cal_args[3] == pytest.approx(0.42)
+    assert board.replay_overrides()["azimuth_offset_rad"] == pytest.approx(0.42)
+
+
+@pytest.mark.parametrize("value", [float("nan"), 4.0, -4.0, "0.1"])
+def test_an_azimuth_offset_that_is_not_a_phase_is_refused(tmp_path, value):
+    raw = json.loads(Path(REFERENCE).read_text(encoding="utf-8"))
+    raw["azimuth_offset_rad"] = value
+    path = tmp_path / "cal.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="azimuth_offset_rad"):
+        BoardCalibration.from_file(path)
+
+
+def test_file_values_round_trip_to_the_json():
+    raw = Calibration.load(REFERENCE).meta
+    board = BoardCalibration.from_file(REFERENCE)
+    assert board.elem_phase_rad == pytest.approx(tuple(raw["elem_phase_rad"]))
+    assert board.elem_gain == pytest.approx(tuple(raw["elem_gain"]))
+
+
+def test_replay_overrides_are_replay_config_fields():
+    overrides = BoardCalibration.from_file(REFERENCE).replay_overrides()
+    config = ReplayConfig(tee_bin=34, **overrides)
+    assert config.elem_gain == BoardCalibration.from_file(REFERENCE).elem_gain
+
+
+@pytest.mark.parametrize("gains", [(1.0,) * 7, (1.0,) * 7 + (0.0,), (1.0,) * 7 + (float("nan"),)])
+def test_bad_elements_are_refused(gains):
+    with pytest.raises(ValueError, match="element"):
+        BoardCalibration(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, (0.0,) * len(gains), gains)
+
+
+def test_the_calibrated_radar_height_reaches_the_ball_fit():
+    cal = Calibration.load(REFERENCE)
+    cal.meta["radar_height_m"] = 0.21
+    board = BoardCalibration.from_calibration(cal)
+    assert board.tunable_overrides() == {"ball.fit.radarHeightM": pytest.approx(0.21)}
+    config = ReplayConfig(tee_bin=34, overrides=board.tunable_overrides())
+    assert config.overrides["ball.fit.radarHeightM"] == pytest.approx(0.21)
+
+
+def test_a_radar_height_outside_the_tunable_bounds_is_skipped_with_a_warning(caplog):
+    cal = Calibration.load(REFERENCE)
+    cal.meta["radar_height_m"] = 1.5
+    board = BoardCalibration.from_calibration(cal)
+    with caplog.at_level("WARNING"):
+        assert board.tunable_overrides() == {}
+    assert "radar height" in caplog.text
+
+
+# --- which calibration a live run uses -------------------------------------------------
+
+
+def test_the_reference_is_used_until_this_board_is_measured(tmp_path):
+    from openflight.iwr6843.calibration import DEFAULT_CAL_PATH, resolve_calibration_path
+
+    board_path = tmp_path / "iwr6843_calibration.json"
+    assert resolve_calibration_path(None, board_path=board_path) == Path(DEFAULT_CAL_PATH)
+
+
+def test_a_measured_board_calibration_is_used_without_naming_it(tmp_path):
+    from openflight.iwr6843.calibration import resolve_calibration_path
+
+    board_path = tmp_path / "iwr6843_calibration.json"
+    board_path.write_text(Path(REFERENCE).read_text(encoding="utf-8"), encoding="utf-8")
+    assert resolve_calibration_path(None, board_path=board_path) == board_path
+
+
+def test_an_explicit_calibration_overrides_the_board_file(tmp_path):
+    from openflight.iwr6843.calibration import resolve_calibration_path
+
+    board_path = tmp_path / "iwr6843_calibration.json"
+    board_path.write_text("{}", encoding="utf-8")
+    chosen = resolve_calibration_path("other.json", board_path=board_path)
+    assert chosen == Path("other.json")
+
+
+def test_the_board_file_lives_with_the_other_machine_settings():
+    from openflight.iwr6843.calibration import BOARD_CAL_PATH
+
+    assert BOARD_CAL_PATH == Path.home() / ".config" / "openflight" / "iwr6843_calibration.json"

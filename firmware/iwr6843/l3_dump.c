@@ -14,7 +14,8 @@
  * triggers EDMA copies of selected range bins into the compact L3 ring. The CPU
  * rearms one frame at a time during inter-frame idle time. Completed frames
  * advance through the compact L3 ring so a trigger can preserve deterministic
- * pre-impact history plus a fixed post-impact tail.
+ * pre-impact history plus a fixed post-impact tail. The leave detector runs on
+ * a finished pre-trigger slot while the HWA writes the next one.
  *
  * Chirp order filled == chirp order fired == TDM (chirp c -> tx=c%N_TX,
  * loop=c/N_TX), matching iwr6843_l3dump.
@@ -46,22 +47,69 @@
 #include <ti/control/mmwavelink/mmwavelink.h>
 #include <ti/control/mmwave/mmwave.h>
 #include <ti/utils/cli/cli.h>
+#include <ti/utils/cycleprofiler/cycle_profiler.h>
 
 #include "dump_format.h"
+#include "detect_queue.h"
+#include "capture_plan.h"
+#include "track_select.h"
+#include "l3_trigger.h"
+#include "l3_ball.h"
+#include <math.h>
+
+#include "l3_angle.h"
+#include "l3_ball_track.h"
+#include "l3_club_track.h"
+#include "l3_adaptive.h"
+#include "l3_band.h"
+#include "l3_impact.h"
+#include "l3_leave.h"
+#include "l3_scan.h"
+#include "l3_impact_fit.h"
+#include "l3_iq8.h"
+#include "l3_iq16_stats.h"
+#include "l3_bin_score.h"
+#include "l3_channels.h"
+#include "l3_angle_queue.h"
+#include "l3_dsp_ipc.h"
+#include "l3_detect_core.h"
+#include "l3_timing.h"
+#include "l3_retain.h"
+#include "compact_iq16.h"
+#include "l3_profile.h"
+#include "l3_result.h"
+#include "l3_shot.h"
+#include "l3_window.h"
+#include "fw_version.h"
 
 #if defined(L3_DUMP_IQ8) || defined(L3_RING_IQ8)
 #define L3_ANY_IQ8 1
 #endif
 
-/* --- task priorities (mirror the mmw demo): ctrl > CLI. -------------------- */
+/* --- task priorities: ctrl > rearm > detect > CLI. -------------------------- */
 #define L3_INIT_TASK_PRIORITY  2
 #define L3_CLI_TASK_PRIORITY   3
-#define L3_HWA_REARM_TASK_PRIORITY (L3_CLI_TASK_PRIORITY - 1U)
 /* Keep the live snapshot worker below CLI. SYS/BIOS Task_yield does not allow
  * lower-priority tasks to run, and a priority-4 snapshot loop starved l3dump
  * so the host only saw the echoed 7-byte "l3dump\n" command. */
 #define L3_SNAPSHOT_TASK_PRIORITY 1
-#define L3_CTRL_TASK_PRIORITY  5
+/* The club's angles off the decision path (l3_angle_queue.h): below the CLI
+ * and the notices, so it runs in the spare time a frame leaves. */
+#define L3_ANGLE_TASK_PRIORITY 2U
+/* Above the CLI, so a polled stats or debug write cannot hold a scratch slot
+ * past its reuse. A stats reply is ~825 B; at 1,041,667 baud that is ~7.9 ms,
+ * about 3 frames at 3 ms, and with detection below the CLI every such poll
+ * dropped those frames before the self-trigger could score the gate. */
+#define L3_DETECT_TASK_PRIORITY (L3_CLI_TASK_PRIORITY + 1U)
+/* Above detection: a slot read must not delay the next HWA arm past the
+ * ~380 us gap a 2 ms frame leaves after its chirps. */
+#define L3_HWA_REARM_TASK_PRIORITY (L3_DETECT_TASK_PRIORITY + 1U)
+/* Writes the detect task's CLI lines. At the CLI task's own priority SYS/BIOS
+ * never preempts one for the other, so neither can splice a line into the
+ * other's; below it, a host command arriving mid-line would let the CLI
+ * task cut a "Triggered" notice or a debug line in two. */
+#define L3_NOTICE_TASK_PRIORITY L3_CLI_TASK_PRIORITY
+#define L3_CTRL_TASK_PRIORITY (L3_HWA_REARM_TASK_PRIORITY + 1U)
 
 /* ASCII CAN is reserved as an out-of-band dump cancellation byte. The CLI
  * task is executing l3dump synchronously, so RX interrupts are disabled and
@@ -128,23 +176,12 @@
 #error "late snapshot window exceeds the range FFT"
 #endif
 #endif
-#ifdef LIVE_SNAPSHOT_RING
-#ifndef SNAPSHOT_DUMP
-#error "LIVE_SNAPSHOT_RING requires SNAPSHOT_DUMP"
-#endif
-#ifndef ENABLE_HWA_SMOKE
-#error "LIVE_SNAPSHOT_RING requires ENABLE_HWA_SMOKE"
-#endif
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
 #ifndef SNAPSHOT_DUMP
 #error "HWA_CHAINED_SNAPSHOT_RING requires SNAPSHOT_DUMP"
 #endif
 #ifndef ENABLE_HWA_SMOKE
 #error "HWA_CHAINED_SNAPSHOT_RING requires ENABLE_HWA_SMOKE"
-#endif
-#ifdef LIVE_SNAPSHOT_RING
-#error "Select either LIVE_SNAPSHOT_RING or HWA_CHAINED_SNAPSHOT_RING"
 #endif
 #endif
 #define CHIRPS_PER_FRAME  (N_TX * LOOPS)                        /* 64 */
@@ -161,40 +198,33 @@
 #define SAVED_CHIRP_BYTES (N_RX * SAVE_SAMPLES * 2 * (uint32_t)sizeof(int16_t))
 
 /* --- rolling buffer (default L3 = 6 banks x 128 KB = 768 KB) ----------------
- * The raw-ring build fills L3 exactly. LIVE_SNAPSHOT_RING is the first compact
- * prototype: EDMA captures one raw frame into scratch, then the HWA compresses
- * selected FFT range bins into the rolling ring. */
+ * The chained-snapshot HWA path compresses selected FFT range bins from each
+ * captured frame into the rolling ring. */
 #ifndef RING_FRAMES
 #define RING_FRAMES  6
 #endif
-#ifndef HWA_POST_TRIGGER_FRAMES
-#define HWA_POST_TRIGGER_FRAMES 8U
-#endif
-#if defined(HWA_CHAINED_SNAPSHOT_RING) && !defined(CONFIGURABLE_CAPTURE)
-#if HWA_POST_TRIGGER_FRAMES >= RING_FRAMES
-#error "HWA_POST_TRIGGER_FRAMES must leave at least one pre-trigger frame"
-#endif
-#endif
 #define RING_CHIRPS  (RING_FRAMES * CHIRPS_PER_FRAME)
-#if defined(LIVE_SNAPSHOT_RING) || defined(HWA_CHAINED_SNAPSHOT_RING)
+#if defined(HWA_CHAINED_SNAPSHOT_RING)
 #define RING_FRAME_COMPLEX SNAPSHOT_FRAME_COMPLEX
 #else
 #define RING_FRAME_COMPLEX SAVED_FRAME_COMPLEX
 #endif
 
-#ifdef CONFIGURABLE_CAPTURE
-#ifndef HWA_CHAINED_SNAPSHOT_RING
-#error "CONFIGURABLE_CAPTURE requires HWA_CHAINED_SNAPSHOT_RING"
-#endif
-#define L3_TOTAL_BYTES         (6U * 128U * 1024U)
+/* Same expression the TI platform linker uses to size the L3_RAM region
+ * (ti/platform/xwr68xx/r4f_linker.cmd), computed from the same two --define
+ * values the SDK passes to both the compiler and the linker. Deriving it
+ * rather than hardcoding means a MMWAVE_L3RAM_NUM_BANK change cannot leave
+ * the firmware's idea of the arena disagreeing with the linker's. */
+#define L3_TOTAL_BYTES         (MMWAVE_L3RAM_NUM_BANK * MMWAVE_SHMEM_BANK_SIZE)
 #define L3_MAX_CAPTURE_FRAMES  64U
 #define L3_MAX_LOOPS           16U
 #define L3_MIN_LOOPS           2U
 #ifdef L3_RING_IQ8
 /* The HWA emits complex16 samples. One maximum-size production frame lands in
- * scratch, then the rearm task block-quantizes it into the compact IQ8 ring.
- * IQ16 mode uses the whole arena directly; IQ8 mode overlays ping-pong scratch
- * onto the upper portion that its compressed capture does not use. */
+ * scratch (g_iq16FrameScratch, in DATA_RAM), then the rearm task
+ * block-quantizes it into the compact IQ8 ring. Both IQ16 and IQ8 mode use
+ * the whole L3 arena directly; only the compressed IQ8 ring's contents
+ * differ in size. */
 #define L3_IQ8_HWA_SHIFT      4U
 #define L3_IQ8_HWA_SCALE      (1U << L3_IQ8_HWA_SHIFT)
 #ifdef L3_IQ8_SPARSE_SCALE
@@ -205,13 +235,25 @@
 #define L3_RING_MAX_BINS       64U
 #define L3_CAPTURE_FORMAT_IQ16 0U
 #define L3_CAPTURE_FORMAT_IQ8  1U
+/* Compact IQ16 formats: the HWA writes the wide processing window to the
+ * IQ16 scratch, the detect task reads it there at full precision, and the
+ * rearm task copies only the retained bins into L3 (compact_iq16.c).
+ * compact16 centres the retained window in the processing window;
+ * adaptive16 places it where l3_retain.c says the shot is. */
+#define L3_CAPTURE_FORMAT_COMPACT16  2U
+#define L3_CAPTURE_FORMAT_ADAPTIVE16 3U
+#define L3_SCRATCH_NONE 0xFFU
 #define L3_IQ16_SCRATCH_FRAME_BYTES  \
     (N_TX * L3_MAX_LOOPS * N_RX * L3_RING_MAX_BINS * 2U * \
      (uint32_t)sizeof(int16_t))
-#define L3_IQ16_SCRATCH_BYTES  (2U * L3_IQ16_SCRATCH_FRAME_BYTES)
 #define L3_IQ16_SCRATCH_WORDS  \
     (L3_IQ16_SCRATCH_FRAME_BYTES / (uint32_t)sizeof(int16_t))
-#define L3_IQ8_CAPTURE_BYTES   (L3_TOTAL_BYTES - L3_IQ16_SCRATCH_BYTES)
+#endif
+#ifndef L3_RING_MAX_BINS
+/* Only meaningful for the iq8 ring; harmless placeholder for the plan
+ * geometry when this build has no iq8 support at all, since l3plan_build
+ * only consults it when bytesPerComplex == 2U (iq8). */
+#define L3_RING_MAX_BINS       N_SAMPLES
 #endif
 #define L3_DEFAULT_PRE_START   20U
 #define L3_DEFAULT_PRE_BINS    32U
@@ -226,50 +268,36 @@
 #endif
 #define L3_MAX_POST_STRIDE     16U
 
-typedef struct {
-    uint8_t preStart;
-    uint8_t preBins;
-    uint8_t postStart;
-    uint8_t postBins;
-    uint8_t lateStart;
-    uint8_t postFrames;
-    uint8_t postStride;
-    uint8_t preFrames;
-    uint8_t totalFrames;
-    uint16_t loops;
-    uint16_t chirpsPerFrame;
-    uint32_t preFrameBytes;
-    uint32_t postFrameBytes;
-    uint32_t postBaseOffset;
-    uint32_t usedBytes;
-    uint8_t phased;
-    uint8_t requestedPreFrames;
-    uint8_t impactStart;
-    uint8_t impactBins;
-    uint8_t impactFrames;
-    uint8_t ballFrames;
-    uint32_t impactFrameBytes;
-} l3_capture_plan_t;
+/* L3CapturePlan (capture_plan.h) mirrors what used to be a private
+ * l3_capture_plan_t defined here; it now lives there so l3plan_build can be
+ * compiled and tested on the host without any TI headers. */
 
 #pragma DATA_SECTION(g_ring, ".l3ring")
 #pragma DATA_ALIGN(g_ring, 8)
 static uint8_t g_ring[L3_TOTAL_BYTES];
 #ifdef L3_RING_IQ8
 static uint8_t gCaptureFormat = L3_CAPTURE_FORMAT_IQ16;
-#define g_iq16FrameScratch \
-    (*((int16_t (*)[2][L3_IQ16_SCRATCH_WORDS]) \
-       (void *)&g_ring[L3_IQ8_CAPTURE_BYTES]))
+#pragma DATA_SECTION(g_iq16FrameScratch, ".dataScratch")
+#pragma DATA_ALIGN(g_iq16FrameScratch, 8)
+static int16_t g_iq16FrameScratch[2][L3_IQ16_SCRATCH_WORDS];
+/* DATA_RAM is 0x30000 B and is shared with .bss, .data and the stack. If this
+ * fires, either the scratch or the rest of the image grew past the region. */
+_Static_assert(sizeof(g_iq16FrameScratch) <= 0x18000U,
+               "IQ16 scratch exceeds its DATA_RAM allowance");
 #endif
-static l3_capture_plan_t gCapturePlan = {
-    L3_DEFAULT_PRE_START,
-    L3_DEFAULT_PRE_BINS,
-    L3_DEFAULT_POST_START,
-    L3_DEFAULT_POST_BINS,
-    L3_DEFAULT_LATE_START,
-    L3_DEFAULT_POST_FRAMES,
-    L3_DEFAULT_POST_STRIDE,
-    0U, 0U, 0U, 0U, 0U, 0U, 0U,
-    0U, 0U, 0U, 0U, 0U, 0U, 0U
+static L3CapturePlan gCapturePlan = {
+    .preStart = L3_DEFAULT_PRE_START,
+    .preBins = L3_DEFAULT_PRE_BINS,
+    .postStart = L3_DEFAULT_POST_START,
+    .postBins = L3_DEFAULT_POST_BINS,
+    .lateStart = L3_DEFAULT_LATE_START,
+    .postFrames = L3_DEFAULT_POST_FRAMES,
+    .postStride = L3_DEFAULT_POST_STRIDE,
+    /* preFrames, totalFrames, loops, chirpsPerFrame, preFrameBytes,
+     * postFrameBytes, postBaseOffset, usedBytes, phased,
+     * requestedPreFrames, impactStart, impactBins, impactFrames,
+     * ballFrames and impactFrameBytes are all zero-initialized and are
+     * recomputed by l3plan_build(). */
 };
 static uint8_t gFrameBinStart[L3_MAX_CAPTURE_FRAMES];
 static uint8_t gFrameBinCount[L3_MAX_CAPTURE_FRAMES];
@@ -279,24 +307,7 @@ static uint32_t gFrameBytes[L3_MAX_CAPTURE_FRAMES];
 #ifdef L3_ANY_IQ8
 static uint16_t gFrameIq8Scale[L3_MAX_CAPTURE_FRAMES];
 #endif
-#else
-#pragma DATA_SECTION(g_ring, ".l3ring")
-#pragma DATA_ALIGN(g_ring, 8)
-static int16_t g_ring[RING_FRAMES][RING_FRAME_COMPLEX * 2];
 
-#ifdef SNAPSHOT_DYNAMIC_WINDOWS
-/* Stored in ring-slot order and emitted directly before the v4 IQ payload. */
-static uint8_t gFrameBinStart[RING_FRAMES];
-#endif
-#endif
-
-#ifdef LIVE_SNAPSHOT_RING
-/* Two raw frame scratch buffers let EDMA keep chirping while the snapshot task
- * compresses the previously completed frame into the compact ring. */
-#pragma DATA_SECTION(g_rawFrame, ".l3scratch")
-#pragma DATA_ALIGN(g_rawFrame, 8)
-static int16_t g_rawFrame[2][FRAME_COMPLEX * 2];
-#endif
 
 /* --- EDMA: the DFE chirp-available hardware event channel + shadow link ----- */
 #define L3_EDMA_CHANNEL       EDMA_TPCC0_REQ_DFE_CHIRP_AVAIL
@@ -342,12 +353,12 @@ static int32_t       gHwaRealErr;
 static uint16_t      gHwaRealPeakBin;
 static uint32_t      gHwaRealPeakPower;
 static uint32_t      gHwaRealRuns;
-#ifdef LIVE_SNAPSHOT_RING
-static uint8_t       gHwaFftConfigured;
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
 static Semaphore_Handle gHwaRearmSemaphore;
 static Semaphore_Handle gHwaFreezeSemaphore;
+static Semaphore_Handle gDetectSemaphore;
+static L3DetectQueue gDetectQueue;
+static volatile uint32_t gDetectStale;
 #ifdef L3_IQ8_EDMA_PACK
 static Semaphore_Handle gIq8EdmaDoneSemaphore;
 #endif
@@ -366,33 +377,176 @@ static volatile uint32_t gRingFrame;    /* completed snapshot frames since the
 static volatile uint32_t gNumWrap;      /* EDMA ring-wrap count */
 static volatile uint32_t gCalibStatus;  /* RL_RF_AE_INITCALIBSTATUS payload */
 static volatile uint32_t gRfFaults;     /* CPU/ESM/analog fault events */
-#ifdef LIVE_SNAPSHOT_RING
-static volatile uint32_t gRawFrameReadyMask;
-static volatile uint32_t gRawFrameDrops;
-static volatile uint32_t gSnapshotFrames;
-static volatile uint32_t gSnapshotErrors;
-static volatile uint8_t  gSnapshotBusy;
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
 static volatile uint32_t gHwaFrameDone;
 static volatile uint32_t gHwaOutputDone;
 static volatile uint32_t gHwaRearms;
 static volatile uint32_t gHwaRearmErrors;
 static volatile uint32_t gHwaMissedFrameStarts;
+/* Frame completion queued -> next HWA arm, in microseconds. */
+static volatile uint32_t gHwaRearmQueuedCycles;
+static volatile uint8_t  gHwaRearmQueuedValid;
+static volatile uint32_t gHwaRearmLastUs;
+static volatile uint32_t gHwaRearmMaxUs;
+static volatile uint32_t gHwaRearmTimed;
 static volatile uint8_t  gHwaArmedForFrame;
 static volatile uint8_t  gHwaDoneSeen;
 static volatile uint8_t  gHwaOutputSeen;
 static volatile uint8_t  gHwaRearmPending;
 static volatile uint8_t  gHwaRearmBusy;
 static volatile uint8_t  gHwaFreezeRequested;
+static volatile uint8_t  gTriggerEnabled;
+static volatile uint8_t  gSelfTriggerLatched;
+/* Self-trigger front end (l3_trigger.c): the watch region, the noise floor
+ * the club targets are extracted against, and the raw-input trace. The
+ * detect task updates it once per completed slot with gTrigBusy raised; the
+ * CLI task (triggerCfg, triggerLog) waits for that flag before it resets or
+ * reads the state. The club track's range-only impact fires the capture.
+ * gTriggerPhase is the readout the host's stats parser already knows. */
+static l3_trig_cfg_t     gTrigCfg;
+/* How targets read their sub-bin range (L3_OBS_SUBBIN_*): "trackCfg subbin". */
+static uint32_t          gObsSubBin = L3_OBS_SUBBIN_PARABOLIC;
+static l3_trig_t         gTrig;
+static volatile uint8_t  gTrigBusy;
+static float             gTrigLoopPeriodS;
+/* Ball-placement detector (l3_ball.c): fed the pre window's static power
+ * every other frame by the detect task; "ball cfg" resets it under the
+ * same busy handshake as triggerCfg. */
+static l3_ball_cfg_t     gBallCfg;
+static l3_ball_t         gBall;
+static volatile uint8_t  gBallBusy;
+/* Where the last scored frame aimed: the locked ball (1) or the configured
+ * tee (0). With follow on and no ball locked the trigger falls back to the
+ * tee and counts the frames, so the ball detector cannot make a shot
+ * uncapturable while it is being proven. */
+static volatile uint8_t  gTrigDestBall;
+static volatile uint32_t gTrigFallbackFrames;
+/* Club track (l3_club_track.c) over the observation layer's targets, fed
+ * the same per-bin observations the trigger scores, every frame. Reset with
+ * the ring; "triggerLog track" prints it. */
+static l3_club_track_t   gClubTrack;
+static uint32_t          gClubTrackDest;
+/* Radar calibration (attitude, element corrections, baseline zeros, range
+ * bias) for angles and golf-frame positions; identity until "trackCfg cal"
+ * and "trackCfg elem" set it. gLastAngle is the newest club point's estimate. */
+static l3_radar_cal_t    gRadarCal;
+static l3_angle_obs_t    gLastAngle;
+static uint32_t          gAngleEstimates;
+/* The locked ball's own angles from its static return, so the destination
+ * the impact test and the ball tracker aim at is a 3D position, not a
+ * point on boresight. Valid while the beamformer's peak stands clear. */
+static l3_angle_obs_t    gBallAngle;
+static uint8_t           gBallAngleValid;
+/* The ball detector's cadence (l3_ball.h framesPerUpdate): a ball on its
+ * tee does not move, so its static scan runs every eighth frame (24 ms),
+ * its counts and rates scaled to the same times as before. Its angle is
+ * estimated on a new or moved lock and refreshed every
+ * L3_BALL_ANGLE_REFRESH_UPDATES updates (~0.5 s), not every update. */
+#define L3_BALL_FRAMES_PER_UPDATE      8U
+#define L3_BALL_ANGLE_REFRESH_UPDATES  20U
+static l3_ball_angle_clock_t gBallAngleClock;
+#define L3_BALL_ANGLE_MIN_PEAK_RATIO 3.0F
+/* The range-only impact's configuration ("trackCfg impact <horizonS>"). */
+static l3_impact_cfg_t   gImpactCfg;
+static uint8_t           gImpactCfgSet;
+static l3_delivery_t     gDelivery;        /* the newest frame's delivery fit */
+static l3_vec3_t         gBallPosition;    /* destination in the golf frame */
+/* The tee band (l3_band.h) and the impact from the tracks either side of it
+ * (l3_impact_fit.h), as firmware_replay runs them. bandBins 0 (the default)
+ * is no band: the club track, the ball tracker and the post-impact targets
+ * behave exactly as before the band existed. gRangeImpact is the range-only
+ * impact from the club-in estimate (l3_impact_update_range): the
+ * self-trigger. "trackCfg impactFit <bandBins>" sets the band's width;
+ * the defaults are set once (gImpactFitCfgSet), so a configured band
+ * survives triggerCfg and sensorStart in either order. The band is placed
+ * on every idle pre-impact frame on the noisiest bins near the destination
+ * (gBandNoise, fed from idle frames' whole windows), frozen while the club
+ * track is active (gBandFrozen) and released at the rearm; the noise map
+ * persists across shots. */
+static l3_impact_fit_cfg_t gImpactFitCfg;
+static l3_band_t           gBand;
+static l3_band_noise_t     gBandNoise;
+/* The range FFT's window ("captureCfg window"), loaded into the HWA's window
+ * RAM on each arm (l3_window.h); rectangular until a session asks. */
+static uint8_t             gRangeWindow = L3_RANGE_WINDOW_NONE;
+static int32_t             gRangeWindowCoeffs[N_SAMPLES / 2U];
+static uint8_t             gBandFrozen;
+static l3_impact_t         gRangeImpact;   /* range-only fire (l3_impact_update_range) */
+static l3_leave_t          gLeave;         /* ball-leave fallback (l3_leave_update) */
+static l3_scan_cfg_t       gScanCfg;       /* which bins a frame scores (l3_scan.h) */
+static uint32_t            gMapCursor;     /* band-interior chunk the next idle frame refreshes */
+static float               gLeaveFloor;    /* the fallback's median beyond the band: post floor */
+static uint8_t             gDetectBehind;  /* a newer frame landed before this one was taken */
+static uint32_t            gDetectShed;    /* frames that shed the ball detector, map and angles */
+static l3_impact_fit_t     gImpactFit;
+static uint8_t             gImpactFitCfgSet;
+#define L3_IMPACT_FIT_MAX_BAND_BINS 64.0F
+/* The shot state machine and the post-impact ball tracker. Post frames the
+ * ring keeps are published to the detect task with L3_DETECT_POST_EPOCH;
+ * they are never overwritten before the rearm, so no liveness check. */
+#define L3_DETECT_POST_EPOCH 0xFFFFFFFFU
+static l3_shot_cfg_t       gShotCfg;
+static l3_shot_t           gShot;
+static l3_ball_track_cfg_t gBallTrackCfg;
+static l3_ball_track_t     gBallTrack;
+/* "trackCfg ballSnr <snr>": the ball's extraction snr apart from the
+ * trigger's; 0 keeps gBallTrackCfg's default. Kept across triggerCfg and
+ * sensorStart, as the band is. */
+static float               gBallSnr;
+#define L3_BALL_SNR_MAX 1.0e6F
+static l3_launch_t         gLaunch;
+static uint32_t            gPostTimestampUs;   /* time of the newest post frame scored */
+static uint32_t            gPostFramesScored;
+/* The post window's own noise floor: the pre region's floor sits under the
+ * golfer's returns and would hide the weak departing ball. */
+static float               gBallFloor;
+/* The shot result, built once per shot when the machine reaches RESULT;
+ * "triggerLog result" prints it with its packet. */
+static l3_shot_result_t    gShotResult;
+static uint8_t             gShotResultReady;
+static uint32_t            gShotId;
+/* Per-stage cycle counts ("triggerLog perf") and the adaptive capture
+ * windows applied between shots from the locked ball bin. */
+/* MSS-only diagnostics live in HS-RAM (mss_linker.cmd .hsramMss): DATA_RAM
+ * is full. Not zeroed at load like .bss, so l3_initTask clears them. */
+#define L3_HSRAM_DIAG __attribute__((section(".hsramMss")))
+
+static l3_profile_t        gProfile L3_HSRAM_DIAG;
+/* The club's pending angles and the angle task's stack, in HS-RAM too:
+ * MSS-only, and DATA_RAM (the heap included) is full. */
+#define L3_ANGLE_TASK_STACK_BYTES 2048U
+static l3_angle_queue_t gAngleQueue L3_HSRAM_DIAG;
+static uint8_t gAngleTaskStack[L3_ANGLE_TASK_STACK_BYTES] L3_HSRAM_DIAG;
+static Semaphore_Handle gAngleSemaphore = NULL;
+static uint8_t             gProfileReady;
+/* Which core scores a frame's bins (l3_detect_core.h: "trackCfg
+ * detectCore"), and when each frame was acquired, taken, scored and decided
+ * (l3_timing.h: "triggerLog perf" and "triggerLog timing"). gDetectEvent is
+ * the frame the detect task is on; gDetectRingEpoch its queue epoch, which
+ * l3_detectFrameStale checks again once the frame has been read (POST: a
+ * post-impact slot, never reused while frozen, or no frame at all). */
+static l3_detect_core_t    gDetectCore;
+static uint8_t             gDetectCoreReady;
+static l3_timing_t         gTiming L3_HSRAM_DIAG;
+static uint8_t             gTimingReady;
+static l3_timing_event_t   gDetectEvent;
+static uint32_t            gDetectRingEpoch = 0xFFFFFFFFU; /* L3_DETECT_POST_EPOCH */
+static volatile uint32_t   gDetectStaleAfterRead;
+static l3_adaptive_cfg_t   gAdaptiveCfg;
+static l3_adaptive_windows_t gAdaptiveWindows;
+static uint32_t            gAdaptiveApplied;
+/* trackCfg's range resolution, defined with the on-chip selector below. */
+static double            gTrackRangeResM;
+static volatile uint8_t  gTriggerPhase;
+static volatile uint32_t gTriggerTeePower;
+static volatile uint8_t  gTriggerDebug;
+static volatile uint8_t  gTriggerDebugPhase = 0xFFU;
 static volatile uint8_t  gHwaShutdownRequested;
 static volatile uint32_t gHwaFreezeRequestFrame;
-static volatile uint32_t gHwaFreezeTargetFrame;
 static volatile uint32_t gHwaFreezeRequests;
 static volatile uint32_t gHwaFreezeCompletions;
 static volatile uint32_t gHwaFreezeTimeouts;
 static volatile uint32_t gHwaFreezeRestarts;
-#ifdef CONFIGURABLE_CAPTURE
 static volatile uint32_t gPreFramesCaptured;
 static volatile uint32_t gPostFramesCaptured;
 static volatile uint32_t gPostFramesObserved;
@@ -403,11 +557,16 @@ static volatile uint8_t  gActiveFrameShouldKeep;
 static volatile uint8_t  gIq8Pending;
 static volatile uint32_t gIq8PendingSlot;
 static volatile uint8_t  gIq8PendingScratch;
+static volatile uint8_t  gIq8PendingDetect;
+static volatile uint32_t gIq8PendingEpoch;
 static volatile uint8_t  gIq8ActiveScratch;
 static volatile uint32_t gIq8PackFrames;
 static volatile uint32_t gIq8PackOverruns;
 static volatile uint32_t gIq8ClippedComponents;
 #ifdef L3_IQ8_EDMA_PACK
+static volatile uint8_t  gIq8PackDetectArm[2];
+static volatile uint16_t gIq8PackDetectSlot[2];
+static volatile uint32_t gIq8PackDetectEpoch[2];
 static volatile uint8_t  gIq8EdmaBusy[2];
 static volatile uint32_t gIq8EdmaDone;
 static volatile uint32_t gIq8EdmaErrors;
@@ -415,7 +574,23 @@ static volatile uint32_t gIq8EdmaWaits;
 static uint16_t gIq8FixedScale = 128U;
 static uint8_t  gIq8FixedShift = 7U;
 #endif
-#endif
+/* Compact IQ16 formats: which scratch holds each slot's processing frame,
+ * the processing window it covered, and whether that scratch is fresh. */
+static uint8_t  gFrameScratch[L3_MAX_CAPTURE_FRAMES];
+static uint8_t  gFrameProcessStart[L3_MAX_CAPTURE_FRAMES];
+static uint8_t  gFrameProcessBins[L3_MAX_CAPTURE_FRAMES];
+static volatile uint32_t gScratchFrame[2];   /* HWA output count when the scratch last completed */
+static volatile uint8_t  gScratchBusy[2];    /* the HWA is writing (or about to write) it */
+static volatile uint8_t  gActiveProcessStart;
+static volatile uint8_t  gActiveProcessBins;
+static volatile uint32_t gDetectScratchStale; /* detect frames whose scratch was reused first */
+static volatile uint32_t gCompactFrames;
+static volatile uint32_t gCompactErrors;
+static volatile uint32_t gCompactMaxUs;
+static l3_retain_cfg_t   gRetainCfg;
+static uint8_t           gRetainCfgReady;
+static l3_retain_window_t gLastRetain;
+static l3_frame_desc_t   gFrameDesc[L3_MAX_CAPTURE_FRAMES];
 #endif
 #endif
 
@@ -425,10 +600,11 @@ static MMWave_CtrlCfg gCtrlCfg;
 
 /* Forward declarations. */
 int32_t l3_cli_dump(int32_t argc, char *argv[]);
+int32_t l3_cli_sparse(int32_t argc, char *argv[]);
+int32_t l3_cli_track(int32_t argc, char *argv[]);
 static int32_t l3_cli_sensorStart(int32_t argc, char *argv[]);
 static int32_t l3_cli_sensorStop(int32_t argc, char *argv[]);
 static int32_t l3_cli_stats(int32_t argc, char *argv[]);
-#ifdef CONFIGURABLE_CAPTURE
 static int32_t l3_cli_captureCfg(int32_t argc, char *argv[]);
 static int32_t l3_cli_phaseCaptureCfg(int32_t argc, char *argv[]);
 #ifdef L3_RING_IQ8
@@ -437,21 +613,24 @@ static int32_t l3_cli_captureFormat(int32_t argc, char *argv[]);
 static int32_t l3_cli_iq8Scale(int32_t argc, char *argv[]);
 #endif
 #endif
-#endif
 #ifdef ENABLE_HWA_SMOKE
 static int32_t l3_cli_hwaStats(int32_t argc, char *argv[]);
 static int32_t l3_cli_hwaTest(int32_t argc, char *argv[]);
 static int32_t l3_cli_hwaReal(int32_t argc, char *argv[]);
 #endif
 static int32_t l3_armCapture(void);
-#ifdef LIVE_SNAPSHOT_RING
-static void l3_snapshotTask(UArg arg0, UArg arg1);
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
 static void l3_hwaRearmTask(UArg arg0, UArg arg1);
+static void l3_considerSelfTrigger(uint32_t slot);
+static void l3_considerBall(uint32_t slot);
+static void l3_considerBallTrack(uint32_t slot);
+static void l3_publishDetectFrame(uint32_t slot, uint32_t epoch);
+static void l3_resetDetectQueue(void);
+static void l3_detectTask(UArg arg0, UArg arg1);
+static void l3_noticeTask(UArg arg0, UArg arg1);
+static void l3_trigRearm(void);
 #endif
 
-#ifdef CONFIGURABLE_CAPTURE
 static int32_t l3_parseU8(const char *text, uint8_t *value)
 {
     char *end = NULL;
@@ -473,13 +652,62 @@ static uint8_t l3_captureUsesIq8(void)
 #endif
 }
 
-static uint32_t l3_captureCapacityBytes(void)
+/* The HWA writes to the IQ16 scratch (not straight into L3) for IQ8 and the
+ * compact IQ16 formats. */
+static uint8_t l3_captureUsesScratch(void)
 {
 #ifdef L3_RING_IQ8
-    if (l3_captureUsesIq8()) {
-        return L3_IQ8_CAPTURE_BYTES;
-    }
+    return (uint8_t)(gCaptureFormat != L3_CAPTURE_FORMAT_IQ16);
+#else
+    return 0U;
 #endif
+}
+
+/* The ring holds a retained IQ16 window of each processing frame. */
+static uint8_t l3_captureCompactsIq16(void)
+{
+#ifdef L3_RING_IQ8
+    return (uint8_t)(gCaptureFormat == L3_CAPTURE_FORMAT_COMPACT16 ||
+                     gCaptureFormat == L3_CAPTURE_FORMAT_ADAPTIVE16);
+#else
+    return 0U;
+#endif
+}
+
+static const char *l3_captureFormatName(void)
+{
+#ifdef L3_RING_IQ8
+    switch (gCaptureFormat) {
+    case L3_CAPTURE_FORMAT_IQ8:
+        return "iq8";
+    case L3_CAPTURE_FORMAT_COMPACT16:
+        return "compact16";
+    case L3_CAPTURE_FORMAT_ADAPTIVE16:
+        return "adaptive16";
+    default:
+        return "iq16";
+    }
+#else
+    return "iq16";
+#endif
+}
+
+#ifdef L3_RING_IQ8
+static void l3_ensureRetainCfg(void)
+{
+    if (!gRetainCfgReady) {
+        l3_retain_cfg_defaults(&gRetainCfg);
+        gRetainCfgReady = 1U;
+    }
+}
+#endif
+
+static uint32_t l3_captureCapacityBytes(void)
+{
+    /* Both IQ8 and IQ16 capture use the entire L3 arena: the IQ16 ping/pong
+     * scratch that used to be carved out of the tail of g_ring now lives in
+     * DATA_RAM (see g_iq16FrameScratch), so there is no smaller IQ8-only
+     * capacity to report. */
     return L3_TOTAL_BYTES;
 }
 
@@ -497,21 +725,34 @@ static int32_t l3_cli_captureFormat(int32_t argc, char *argv[])
         return -1;
     }
     if (argc != 2) {
-        CLI_write("Error: captureFormat needs iq16 or iq8\n");
+        CLI_write("Error: captureFormat needs iq16, iq8, compact16 or adaptive16\n");
         return -1;
     }
     if (strcmp(argv[1], "iq16") == 0) {
         gCaptureFormat = L3_CAPTURE_FORMAT_IQ16;
     } else if (strcmp(argv[1], "iq8") == 0) {
         gCaptureFormat = L3_CAPTURE_FORMAT_IQ8;
+    } else if (strcmp(argv[1], "compact16") == 0) {
+        gCaptureFormat = L3_CAPTURE_FORMAT_COMPACT16;
+    } else if (strcmp(argv[1], "adaptive16") == 0) {
+        gCaptureFormat = L3_CAPTURE_FORMAT_ADAPTIVE16;
     } else {
-        CLI_write("Error: captureFormat needs iq16 or iq8\n");
+        CLI_write("Error: captureFormat needs iq16, iq8, compact16 or adaptive16\n");
         return -1;
+    }
+    l3_ensureRetainCfg();
+    /* compact16 keeps the policy off (centred windows); adaptive16 turns it
+     * on. Retain widths default to 16/24/16 until captureCfg retain says. */
+    gRetainCfg.enabled = (uint8_t)(gCaptureFormat == L3_CAPTURE_FORMAT_ADAPTIVE16);
+    if (l3_captureCompactsIq16() && gCapturePlan.retainPreBins == 0U) {
+        gCapturePlan.retainPreBins = 16U;
+        gCapturePlan.retainImpactBins = 24U;
+        gCapturePlan.retainPostBins = 16U;
     }
     gCapturePlan.preFrames = 0U;
     gCapturePlan.totalFrames = 0U;
     gCapturePlan.usedBytes = 0U;
-    CLI_write("Capture format: %s\n", l3_captureUsesIq8() ? "iq8" : "iq16");
+    CLI_write("Capture format: %s\n", l3_captureFormatName());
     return 0;
 }
 
@@ -553,146 +794,69 @@ static int32_t l3_cli_iq8Scale(int32_t argc, char *argv[])
 
 static int32_t l3_finalizeCapturePlan(uint16_t loops)
 {
-    uint32_t bytesPerBin;
-    uint32_t bytesPerComplex;
-    uint32_t captureBytes;
-    uint32_t postBytes;
-    uint32_t remaining;
-    uint32_t preFrames;
-    uint32_t frame;
-    uint32_t cursor;
+    static const L3CaptureGeometry geometry = {
+        N_TX, N_RX, N_SAMPLES, L3_MAX_CAPTURE_FRAMES,
+        L3_MAX_LOOPS, L3_MIN_LOOPS, L3_RING_MAX_BINS, L3_MAX_POST_STRIDE
+    };
+    L3CaptureTables tables = {
+        gFrameBinStart, gFrameBinCount, gFrameDeltaUs, gFrameOffset, gFrameBytes
+    };
+    uint32_t captureBytes = l3_captureCapacityBytes();
+    char err[128];
 
-    if (loops < L3_MIN_LOOPS || loops > L3_MAX_LOOPS || (loops & 1U) != 0U) {
-        CLI_write("Error: loops must be even and between %u and %u\n",
-                  (unsigned)L3_MIN_LOOPS, (unsigned)L3_MAX_LOOPS);
-        return -1;
-    }
-#ifdef L3_RING_IQ8
-    if (l3_captureUsesIq8() &&
-        (gCapturePlan.preBins > L3_RING_MAX_BINS ||
-         gCapturePlan.postBins > L3_RING_MAX_BINS ||
-         (gCapturePlan.phased &&
-          gCapturePlan.impactBins > L3_RING_MAX_BINS))) {
-        CLI_write("Error: iq8 capture windows cannot exceed %u bins\n",
+    gCapturePlan.compact = l3_captureCompactsIq16();
+    if (l3_captureUsesScratch() &&
+        (gCapturePlan.preBins > L3_RING_MAX_BINS || gCapturePlan.postBins > L3_RING_MAX_BINS ||
+         (gCapturePlan.phased && gCapturePlan.impactBins > L3_RING_MAX_BINS))) {
+        CLI_write("Error: scratch capture windows cannot exceed %u bins\n",
                   (unsigned)L3_RING_MAX_BINS);
         return -1;
     }
+#ifdef L3_RING_IQ8
+    if (gCapturePlan.compact && gCapturePlan.phased) {
+        /* Spend L3 in priority order (l3_retain.h): every impact frame, then
+         * the first ball frames, then the last club frames. A request that
+         * does not fit is cut rather than refused, and the cut is printed. */
+        l3_retain_request_t request;
+        l3_retain_budget_t budget;
+
+        memset(&request, 0, sizeof(request));
+        request.bytesPerBin = (uint32_t)N_TX * loops * N_RX * l3_captureBytesPerComplex();
+        request.capacityBytes = captureBytes;
+        request.maxFrames = L3_MAX_CAPTURE_FRAMES;
+        request.preBins = gCapturePlan.retainPreBins;
+        request.impactBins = gCapturePlan.retainImpactBins;
+        request.ballBins = gCapturePlan.retainPostBins;
+        request.preFrames = gCapturePlan.requestedPreFrames;
+        request.impactFrames = gCapturePlan.impactFrames;
+        request.ballFrames = gCapturePlan.ballFrames;
+        if (l3_retain_budget(&request, &budget) != 0) {
+            CLI_write("Error: the impact frames do not fit L3 at these retain widths\n");
+            return -1;
+        }
+        if (budget.cutPre || budget.cutBall) {
+            static char budgetLine[96];
+
+            (void)l3_retain_format_budget(&budget, budgetLine, sizeof(budgetLine));
+            CLI_write("Capture %s\n", budgetLine);
+            gCapturePlan.requestedPreFrames = budget.preFrames;
+            gCapturePlan.ballFrames = budget.ballFrames;
+            gCapturePlan.postFrames = (uint8_t)(budget.impactFrames + budget.ballFrames);
+        }
+    }
 #endif
-    if (gCapturePlan.preBins == 0U || gCapturePlan.postBins == 0U ||
-        gCapturePlan.postFrames == 0U ||
-        gCapturePlan.postStride == 0U ||
-        gCapturePlan.postStride > L3_MAX_POST_STRIDE ||
-        gCapturePlan.postFrames >= L3_MAX_CAPTURE_FRAMES ||
-        gFramePeriodUs == 0U ||
-        ((uint32_t)gFramePeriodUs * gCapturePlan.postStride) > 0xFFFFU ||
-        ((uint32_t)gCapturePlan.preStart + gCapturePlan.preBins) > N_SAMPLES ||
-        ((uint32_t)gCapturePlan.postStart + gCapturePlan.postBins) > N_SAMPLES ||
-        ((uint32_t)gCapturePlan.lateStart + gCapturePlan.postBins) > N_SAMPLES ||
-        (gCapturePlan.phased &&
-         (gCapturePlan.requestedPreFrames == 0U ||
-          gCapturePlan.impactBins == 0U ||
-          gCapturePlan.impactFrames == 0U ||
-          gCapturePlan.ballFrames == 0U ||
-          ((uint32_t)gCapturePlan.impactStart + gCapturePlan.impactBins) > N_SAMPLES ||
-          ((uint32_t)gCapturePlan.requestedPreFrames +
-           gCapturePlan.postFrames) > L3_MAX_CAPTURE_FRAMES))) {
-        CLI_write("Error: captureCfg needs valid windows and 1-%u post frames\n",
-                  (unsigned)(L3_MAX_CAPTURE_FRAMES - 1U));
+    if (l3plan_build(&gCapturePlan, &geometry, &tables, loops, gFramePeriodUs,
+                      captureBytes, l3_captureBytesPerComplex(),
+                      err, (uint32_t)sizeof(err)) != 0) {
+        CLI_write("%s", err);
         return -1;
     }
-
-    gCapturePlan.loops = loops;
-    gCapturePlan.chirpsPerFrame = (uint16_t)(N_TX * loops);
-    bytesPerComplex = l3_captureBytesPerComplex();
-    captureBytes = l3_captureCapacityBytes();
-    bytesPerBin = (uint32_t)gCapturePlan.chirpsPerFrame *
-                  N_RX * bytesPerComplex;
-    gCapturePlan.preFrameBytes = bytesPerBin * gCapturePlan.preBins;
-    gCapturePlan.postFrameBytes = bytesPerBin * gCapturePlan.postBins;
-    gCapturePlan.impactFrameBytes = bytesPerBin * gCapturePlan.impactBins;
-    postBytes = gCapturePlan.phased
-                    ? (gCapturePlan.impactFrameBytes * gCapturePlan.impactFrames) +
-                      (gCapturePlan.postFrameBytes * gCapturePlan.ballFrames)
-                    : gCapturePlan.postFrameBytes * gCapturePlan.postFrames;
-    if (postBytes >= captureBytes) {
-        CLI_write("Error: post-trigger capture needs %u bytes; L3 has %u\n",
-                  (unsigned)postBytes, (unsigned)captureBytes);
-        return -1;
+    if (gCapturePlan.compact) {
+        CLI_write("Capture retain: %s pre=%u impact=%u post=%u bins of the processing windows\n",
+                  l3_captureFormatName(), (unsigned)gCapturePlan.retainPreBins,
+                  (unsigned)gCapturePlan.retainImpactBins,
+                  (unsigned)gCapturePlan.retainPostBins);
     }
-    remaining = captureBytes - postBytes;
-    preFrames = gCapturePlan.phased
-                    ? gCapturePlan.requestedPreFrames
-                    : remaining / gCapturePlan.preFrameBytes;
-    if (preFrames == 0U) {
-        CLI_write("Error: capture plan leaves no pre-trigger frame\n");
-        return -1;
-    }
-    if (!gCapturePlan.phased &&
-        preFrames + gCapturePlan.postFrames > L3_MAX_CAPTURE_FRAMES) {
-        preFrames = L3_MAX_CAPTURE_FRAMES - gCapturePlan.postFrames;
-    }
-    if (preFrames == 0U ||
-        preFrames * gCapturePlan.preFrameBytes > remaining) {
-        CLI_write("Error: capture plan exceeds L3 after pre-trigger reservation\n");
-        return -1;
-    }
-
-    gCapturePlan.preFrames = (uint8_t)preFrames;
-    gCapturePlan.totalFrames =
-        (uint8_t)(preFrames + gCapturePlan.postFrames);
-    gCapturePlan.postBaseOffset = preFrames * gCapturePlan.preFrameBytes;
-    cursor = 0U;
-
-    for (frame = 0U; frame < preFrames; frame++) {
-        gFrameOffset[frame] = cursor;
-        gFrameBinStart[frame] = gCapturePlan.preStart;
-        gFrameBinCount[frame] = gCapturePlan.preBins;
-        gFrameDeltaUs[frame] = gFramePeriodUs;
-        gFrameBytes[frame] = gCapturePlan.preFrameBytes;
-        cursor += gCapturePlan.preFrameBytes;
-    }
-
-    if (gCapturePlan.phased) {
-        for (frame = 0U; frame < gCapturePlan.impactFrames; frame++) {
-            uint32_t slot = preFrames + frame;
-            gFrameOffset[slot] = cursor;
-            gFrameBinStart[slot] = gCapturePlan.impactStart;
-            gFrameBinCount[slot] = gCapturePlan.impactBins;
-            gFrameDeltaUs[slot] = gFramePeriodUs;
-            gFrameBytes[slot] = gCapturePlan.impactFrameBytes;
-            cursor += gCapturePlan.impactFrameBytes;
-        }
-        for (frame = 0U; frame < gCapturePlan.ballFrames; frame++) {
-            uint32_t slot = preFrames + gCapturePlan.impactFrames + frame;
-            gFrameOffset[slot] = cursor;
-            gFrameBinStart[slot] =
-                (frame < (gCapturePlan.ballFrames / 2U))
-                    ? gCapturePlan.postStart : gCapturePlan.lateStart;
-            gFrameBinCount[slot] = gCapturePlan.postBins;
-            gFrameDeltaUs[slot] =
-                (frame == 0U)
-                    ? gFramePeriodUs
-                    : (uint16_t)(gFramePeriodUs * gCapturePlan.postStride);
-            gFrameBytes[slot] = gCapturePlan.postFrameBytes;
-            cursor += gCapturePlan.postFrameBytes;
-        }
-    } else {
-        for (frame = 0U; frame < gCapturePlan.postFrames; frame++) {
-            uint32_t slot = preFrames + frame;
-            gFrameOffset[slot] = cursor;
-            gFrameBinStart[slot] =
-                (frame < (gCapturePlan.postFrames / 2U))
-                    ? gCapturePlan.postStart : gCapturePlan.lateStart;
-            gFrameBinCount[slot] = gCapturePlan.postBins;
-            gFrameDeltaUs[slot] =
-                (frame == 0U)
-                    ? gFramePeriodUs
-                    : (uint16_t)(gFramePeriodUs * gCapturePlan.postStride);
-            gFrameBytes[slot] = gCapturePlan.postFrameBytes;
-            cursor += gCapturePlan.postFrameBytes;
-        }
-    }
-    gCapturePlan.usedBytes = cursor;
 
     if (gCapturePlan.phased) {
         CLI_write("Capture plan: loops=%u pre=%ux%u@%uus impact=%ux%u@%uus "
@@ -743,8 +907,132 @@ static int32_t l3_finalizeCapturePlan(uint16_t loops)
  * The post reservation is fixed by the requested count. All remaining L3 is
  * converted into pre-trigger ring slots after frameCfg supplies the loop count.
  */
+/* "captureCfg adaptive <enabled> <approachBins> <marginBins>": follow the
+ * locked ball with the capture windows between shots (l3_adaptive.h). */
+static int32_t l3_cli_captureCfgAdaptive(int32_t argc, char *argv[])
+{
+    uint8_t values[3];
+    int32_t i;
+
+    if (argc != 5) {
+        CLI_write("Error: captureCfg adaptive <enabled> <approachBins> <marginBins>\n");
+        return -1;
+    }
+    for (i = 0; i < 3; i++) {
+        if (l3_parseU8(argv[i + 2], &values[i]) != 0) {
+            CLI_write("Error: captureCfg adaptive value\n");
+            return -1;
+        }
+    }
+    l3_adaptive_cfg_defaults(&gAdaptiveCfg);
+    gAdaptiveCfg.enabled = (values[0] != 0U) ? 1U : 0U;
+    gAdaptiveCfg.approachBins = values[1];
+    gAdaptiveCfg.marginBins = values[2];
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "captureCfg retain <preBins> <impactBins> <postBins>": the IQ16 bins each
+ * slot stores in the compact formats, inside the processing windows.
+ * "captureCfg retainPolicy <approachBins> <marginBins> <impactBiasBins>
+ * <ballSearchLeadBins> <ballFollowLeadBins> <spinFrames>": l3_retain_cfg_t. */
+static int32_t l3_cli_captureCfgRetain(int32_t argc, char *argv[])
+{
+    uint8_t values[6];
+    int32_t i;
+
+    if (gCaptureActive) {
+        CLI_write("Error: stop the sensor before captureCfg retain\n");
+        return -1;
+    }
+    if (strcmp(argv[1], "retain") == 0) {
+        if (argc != 5) {
+            CLI_write("Error: captureCfg retain <preBins> <impactBins> <postBins>\n");
+            return -1;
+        }
+        for (i = 0; i < 3; i++) {
+            if (l3_parseU8(argv[i + 2], &values[i]) != 0 || values[i] == 0U ||
+                values[i] > L3_RING_MAX_BINS) {
+                CLI_write("Error: captureCfg retain widths are 1..%u bins\n",
+                          (unsigned)L3_RING_MAX_BINS);
+                return -1;
+            }
+        }
+        gCapturePlan.retainPreBins = values[0];
+        gCapturePlan.retainImpactBins = values[1];
+        gCapturePlan.retainPostBins = values[2];
+        gCapturePlan.preFrames = 0U;
+        gCapturePlan.totalFrames = 0U;
+        gCapturePlan.usedBytes = 0U;
+        CLI_write("Done\n");
+        return 0;
+    }
+#ifdef L3_RING_IQ8
+    if (argc != 8) {
+        CLI_write("Error: captureCfg retainPolicy <approachBins> <marginBins> <impactBiasBins> "
+                  "<ballSearchLeadBins> <ballFollowLeadBins> <spinFrames>\n");
+        return -1;
+    }
+    for (i = 0; i < 6; i++) {
+        if (l3_parseU8(argv[i + 2], &values[i]) != 0) {
+            CLI_write("Error: captureCfg retainPolicy values must be uint8 integers\n");
+            return -1;
+        }
+    }
+    l3_ensureRetainCfg();
+    {
+        l3_retain_cfg_t cfg = gRetainCfg;
+
+        cfg.approachBins = values[0];
+        cfg.approachMarginBins = values[1];
+        cfg.impactBiasBins = values[2];
+        cfg.ballSearchLeadBins = values[3];
+        cfg.ballFollowLeadBins = values[4];
+        cfg.spinFrames = values[5];
+        if (l3_retain_cfg_check(&cfg) != 0) {
+            CLI_write("Error: captureCfg retainPolicy (approach 1..64, others <= 32)\n");
+            return -1;
+        }
+        gRetainCfg = cfg;
+    }
+    CLI_write("Done\n");
+    return 0;
+#else
+    CLI_write("Error: this build has no compact IQ16 formats\n");
+    return -1;
+#endif
+}
+
+/* "captureCfg window <none|hann>": the range FFT's window from the next arm
+ * (l3_window.h). */
+static int32_t l3_cli_captureCfgWindow(int32_t argc, char *argv[])
+{
+    uint8_t window;
+
+    if (gCaptureActive) {
+        CLI_write("Error: stop the sensor before captureCfg window\n");
+        return -1;
+    }
+    if (argc != 3 || l3_window_parse(argv[2], &window) != 0) {
+        CLI_write("Error: captureCfg window <none|hann>\n");
+        return -1;
+    }
+    gRangeWindow = window;
+    CLI_write("Done\n");
+    return 0;
+}
+
 static int32_t l3_cli_captureCfg(int32_t argc, char *argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "adaptive") == 0) {
+        return l3_cli_captureCfgAdaptive(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "window") == 0) {
+        return l3_cli_captureCfgWindow(argc, argv);
+    }
+    if (argc >= 2 && (strcmp(argv[1], "retain") == 0 || strcmp(argv[1], "retainPolicy") == 0)) {
+        return l3_cli_captureCfgRetain(argc, argv);
+    }
     uint8_t values[7];
     uint32_t valueCount;
     uint32_t i;
@@ -867,7 +1155,6 @@ static int32_t l3_cli_phaseCaptureCfg(int32_t argc, char *argv[])
     gCapturePlan.usedBytes = 0U;
     return 0;
 }
-#endif
 
 #ifdef ENABLE_HWA_SMOKE
 #define HWA_FFT_SAMPLES      128U
@@ -969,20 +1256,10 @@ static int32_t l3_hwaRunFft(uint16_t *peakBin, uint32_t *peakPower)
     *peakPower = 0U;
 
     memset((void *)dst, 0, HWA_MEM_STRIDE);
-#ifdef LIVE_SNAPSHOT_RING
-    if (!gHwaFftConfigured) {
-        errCode = l3_hwaConfigFft();
-        if (errCode != 0) {
-            return errCode;
-        }
-        gHwaFftConfigured = 1U;
-    }
-#else
     errCode = l3_hwaConfigFft();
     if (errCode != 0) {
         return errCode;
     }
-#endif
 
     gHwaDone = 0U;
     errCode = HWA_enableDoneInterrupt(gHwaHandle, l3_hwaDoneCB, NULL);
@@ -994,36 +1271,21 @@ static int32_t l3_hwaRunFft(uint16_t *peakBin, uint32_t *peakPower)
         (void)HWA_disableDoneInterrupt(gHwaHandle);
         return errCode;
     }
-#ifndef LIVE_SNAPSHOT_RING
     errCode = HWA_reset(gHwaHandle);
     if (errCode != 0) {
         (void)HWA_enable(gHwaHandle, 0U);
         (void)HWA_disableDoneInterrupt(gHwaHandle);
         return errCode;
     }
-#endif
     errCode = HWA_setSoftwareTrigger(gHwaHandle);
     if (errCode != 0) {
         (void)HWA_enable(gHwaHandle, 0U);
         (void)HWA_disableDoneInterrupt(gHwaHandle);
         return errCode;
     }
-#ifdef LIVE_SNAPSHOT_RING
-    /* Live snapshot compression runs in the frame-to-frame timing path. A
-     * BIOS tick sleep here guarantees we miss frames, but a fully tight loop
-     * can starve the mmWave/CLI tasks on SYS/BIOS. Poll in short bursts and
-     * yield cooperatively so the firmware stays responsive while avoiding a
-     * full millisecond-scale sleep per chirp. */
-    for (wait = 0U; wait < 200000U && !gHwaDone; wait++) {
-        if ((wait & 0x3FFU) == 0x3FFU) {
-            Task_yield();
-        }
-    }
-#else
     for (wait = 0U; wait < 200U && !gHwaDone; wait++) {
         Task_sleep(1);
     }
-#endif
     (void)HWA_enable(gHwaHandle, 0U);
     (void)HWA_disableDoneInterrupt(gHwaHandle);
     if (!gHwaDone) {
@@ -1079,7 +1341,6 @@ static int32_t l3_snapshotChirpToBuffer(const int16_t *rawChirp, int16_t *out)
     return 0;
 }
 
-#ifndef LIVE_SNAPSHOT_RING
 static int32_t l3_emitSnapshotChirp(const int16_t *rawChirp)
 {
     int16_t out[N_RX * SNAPSHOT_BINS * 2U];
@@ -1094,9 +1355,19 @@ static int32_t l3_emitSnapshotChirp(const int16_t *rawChirp)
 }
 #endif
 #endif
-#endif
 
 #ifdef HWA_CHAINED_SNAPSHOT_RING
+/* True when the post-trigger movie is complete and capture may stop.
+ * CALLER MUST HOLD THE CRITICAL SECTION: every call site is already inside
+ * Hwi_disable(), and the globals it reads are written from the EDMA and HWA
+ * completion callbacks. */
+static inline uint8_t l3_shouldFreezeNow(void)
+{
+    return (uint8_t)(gHwaFreezeRequested && gActiveFrameIsPost &&
+                     gActiveFrameShouldKeep &&
+                     gPostFramesCaptured >= gCapturePlan.postFrames);
+}
+
 static void l3_hwaMaybeQueueRearm(void)
 {
     uintptr_t key;
@@ -1106,10 +1377,10 @@ static void l3_hwaMaybeQueueRearm(void)
     key = Hwi_disable();
     if (gCaptureActive && gHwaDoneSeen && gHwaOutputSeen && !gHwaRearmPending) {
         if (gHwaShutdownRequested) {
-#if defined(CONFIGURABLE_CAPTURE) && defined(L3_RING_IQ8)
-            if (l3_captureUsesIq8()) {
-                /* Let the task pack the completed scratch frame before
-                 * acknowledging the shutdown boundary. */
+#if defined(L3_RING_IQ8)
+            if (l3_captureUsesScratch()) {
+                /* Let the task pack (or compact) the completed scratch frame
+                 * before acknowledging the shutdown boundary. */
                 gHwaRearmPending = 1U;
                 queue = 1U;
             } else
@@ -1120,19 +1391,25 @@ static void l3_hwaMaybeQueueRearm(void)
                 freeze = 1U;
             }
         } else {
-#ifdef CONFIGURABLE_CAPTURE
 #ifdef L3_RING_IQ8
-        if (l3_captureUsesIq8()) {
-            /* The completed IQ16 scratch frame must be packed before scratch
-             * can be reused, including the final retained post frame. */
+        if (l3_captureUsesScratch()) {
+            /* The completed IQ16 scratch frame must be packed or compacted
+             * before scratch can be reused, including the final retained
+             * post frame. */
             if (gHwaFreezeRequested && !gActiveFrameIsPost) {
                 gPostCaptureStarted = 1U;
             }
+            /* This arm queues unconditionally, unlike the IQ16 arm below, which
+             * gates queuing on l3_shouldFreezeNow(). That is deliberate: for IQ8
+             * the completed scratch frame must still be packed by l3_hwaRearmTask
+             * before it can be reused, even on the frame that satisfies the
+             * freeze condition, so the freeze decision itself is deferred to that
+             * task rather than made here. l3_hwaRearmTask re-evaluates
+             * l3_shouldFreezeNow() after packing (l3_dump.c:1944) and freezes
+             * there when it holds. Do not collapse these two bodies. */
             gHwaRearmPending = 1U;
             queue = 1U;
-        } else if (gHwaFreezeRequested && gActiveFrameIsPost &&
-                   gActiveFrameShouldKeep &&
-                   gPostFramesCaptured >= gCapturePlan.postFrames) {
+        } else if (l3_shouldFreezeNow()) {
             gCaptureActive = 0U;
             gHwaFreezeRequested = 0U;
             gHwaFreezeCompletions++;
@@ -1145,9 +1422,7 @@ static void l3_hwaMaybeQueueRearm(void)
             queue = 1U;
         }
 #else
-        if (gHwaFreezeRequested && gActiveFrameIsPost &&
-            gActiveFrameShouldKeep &&
-            gPostFramesCaptured >= gCapturePlan.postFrames) {
+        if (l3_shouldFreezeNow()) {
             gCaptureActive = 0U;
             gHwaFreezeRequested = 0U;
             gHwaFreezeCompletions++;
@@ -1160,18 +1435,11 @@ static void l3_hwaMaybeQueueRearm(void)
             queue = 1U;
         }
 #endif
-#else
-        if (gHwaFreezeRequested && gRingFrame >= gHwaFreezeTargetFrame) {
-            gCaptureActive = 0U;
-            gHwaFreezeRequested = 0U;
-            gHwaFreezeCompletions++;
-            freeze = 1U;
-        } else {
-            gHwaRearmPending = 1U;
-            queue = 1U;
         }
-#endif
-        }
+    }
+    if (queue) {
+        gHwaRearmQueuedCycles = Cycleprofiler_getTimeStamp();
+        gHwaRearmQueuedValid = 1U;
     }
     Hwi_restore(key);
     if (freeze && gHwaFreezeSemaphore != NULL) {
@@ -1189,15 +1457,40 @@ static void l3_hwaChainDoneCB(void *arg)
     l3_hwaMaybeQueueRearm();
 }
 
+#if defined(HWA_CHAINED_SNAPSHOT_RING)
+static void l3_publishDetectFrame(uint32_t slot, uint32_t epoch)
+{
+    if (gCapturePlan.preFrames == 0U) {
+        return;
+    }
+    if (l3detect_publish(&gDetectQueue, (uint16_t)slot, epoch, Cycleprofiler_getTimeStamp()) !=
+        0) {
+        return;
+    }
+    if (gDetectSemaphore != NULL) {
+        Semaphore_post(gDetectSemaphore);
+    }
+}
+
+static void l3_resetDetectQueue(void)
+{
+    l3detect_init(&gDetectQueue);
+    gDetectStale = 0U;
+    if (gDetectSemaphore != NULL) {
+        while (Semaphore_pend(gDetectSemaphore, BIOS_NO_WAIT)) {
+        }
+    }
+}
+#endif
+
 static void l3_hwaOutputDoneCB(uintptr_t arg, uint8_t tcCode)
 {
     (void)arg;
     (void)tcCode;
     gHwaOutputDone++;
     gRingFrame++;
-#ifdef CONFIGURABLE_CAPTURE
 #ifdef L3_RING_IQ8
-    if (l3_captureUsesIq8() && gActiveFrameShouldKeep) {
+    if (l3_captureUsesScratch() && gActiveFrameShouldKeep) {
         uint32_t completedSlot = gActiveFrameIsPost
                                      ? gCapturePlan.preFrames + gPostFramesCaptured
                                      : gPreFramesCaptured % gCapturePlan.preFrames;
@@ -1207,24 +1500,55 @@ static void l3_hwaOutputDoneCB(uintptr_t arg, uint8_t tcCode)
         gIq8PendingSlot = completedSlot;
         gIq8PendingScratch = gIq8ActiveScratch;
         gIq8Pending = 1U;
+        if (l3_captureCompactsIq16()) {
+            /* The detect task reads this scratch frame directly, at full
+             * precision, until the HWA is aimed at the scratch again; the
+             * compaction into L3 happens on the rearm task meanwhile. */
+            gFrameScratch[completedSlot] = gIq8ActiveScratch;
+            gFrameProcessStart[completedSlot] = gActiveProcessStart;
+            gFrameProcessBins[completedSlot] = gActiveProcessBins;
+            gScratchFrame[gIq8ActiveScratch] = gHwaOutputDone;
+            gScratchBusy[gIq8ActiveScratch] = 0U;
+        } else if (gActiveFrameIsPost) {
+            /* Kept IQ8 post frames reach the ball tracker once packed. */
+            gIq8PendingDetect = 1U;
+            gIq8PendingEpoch = L3_DETECT_POST_EPOCH;
+        }
     }
 #endif
     if (gActiveFrameIsPost) {
         gPostFramesObserved++;
         if (gActiveFrameShouldKeep) {
+            uint32_t completedPostSlot = gCapturePlan.preFrames + gPostFramesCaptured;
+
             gPostFramesCaptured++;
+#if defined(L3_RING_IQ8)
+            if (!l3_captureUsesIq8())  /* IQ8 frames publish after packing */
+#endif
+            {
+                /* The ball tracker reads kept post frames as they land. */
+                l3_publishDetectFrame(completedPostSlot, L3_DETECT_POST_EPOCH);
+            }
         }
     } else {
+        uint32_t completedPreSlot = gPreFramesCaptured % gCapturePlan.preFrames;
+
         gPreFramesCaptured++;
         if ((gPreFramesCaptured % gCapturePlan.preFrames) == 0U) {
             gNumWrap++;
         }
-    }
-#else
-    if ((gRingFrame % RING_FRAMES) == 0U) {
-        gNumWrap++;
-    }
+#if defined(L3_RING_IQ8)
+        if (l3_captureUsesIq8()) {
+            if (gActiveFrameShouldKeep) {
+                gIq8PendingEpoch = gPreFramesCaptured;
+                gIq8PendingDetect = 1U;
+            }
+        } else
 #endif
+        {
+            l3_publishDetectFrame(completedPreSlot, gPreFramesCaptured);
+        }
+    }
     gHwaOutputSeen = 1U;
     l3_hwaMaybeQueueRearm();
 }
@@ -1302,9 +1626,14 @@ static int32_t l3_configHwaProcessParam(uint8_t paramIdx, uint8_t outChannel,
     paramCfg.accelModeArgs.fftMode.fftSize = (uint8_t)l3_log2_u32(N_SAMPLES);
     paramCfg.accelModeArgs.fftMode.butterflyScaling = 0x7FU;
     paramCfg.accelModeArgs.fftMode.interfZeroOutEn = HWA_FEATURE_BIT_DISABLE;
-    paramCfg.accelModeArgs.fftMode.windowEn = HWA_FEATURE_BIT_DISABLE;
+    /* The window RAM holds the first half (loaded after HWA_reset). */
+    paramCfg.accelModeArgs.fftMode.windowEn = (gRangeWindow != L3_RANGE_WINDOW_NONE)
+                                                  ? HWA_FEATURE_BIT_ENABLE
+                                                  : HWA_FEATURE_BIT_DISABLE;
     paramCfg.accelModeArgs.fftMode.windowStart = 0U;
-    paramCfg.accelModeArgs.fftMode.winSymm = HWA_FFT_WINDOW_NONSYMMETRIC;
+    paramCfg.accelModeArgs.fftMode.winSymm = (gRangeWindow != L3_RANGE_WINDOW_NONE)
+                                                 ? HWA_FFT_WINDOW_SYMMETRIC
+                                                 : HWA_FFT_WINDOW_NONSYMMETRIC;
     paramCfg.accelModeArgs.fftMode.winInterpolateMode = HWA_FFT_WINDOW_INTERPOLATE_MODE_NONE;
     paramCfg.accelModeArgs.fftMode.magLogEn = HWA_FFT_MODE_MAGNITUDE_LOG2_DISABLED;
     paramCfg.accelModeArgs.fftMode.fftOutMode = HWA_FFT_MODE_OUTPUT_DEFAULT;
@@ -1347,11 +1676,7 @@ static int32_t l3_configHwaOutputEdma(uint8_t channel, uint16_t shadow,
     param->aCount = (uint16_t)(binCount * HWA_COMPLEX16_BYTES);
     param->bCount = (uint16_t)N_RX;
     param->cCount =
-#ifdef CONFIGURABLE_CAPTURE
         (uint16_t)(gCapturePlan.chirpsPerFrame / 2U);
-#else
-        (uint16_t)(CHIRPS_PER_FRAME / 2U);
-#endif
     param->bCountReload = (uint16_t)N_RX;
     param->sourceBindex = (int16_t)(N_SAMPLES * HWA_COMPLEX16_BYTES);
     param->destinationBindex = (int16_t)(binCount * HWA_COMPLEX16_BYTES);
@@ -1450,11 +1775,7 @@ static int32_t l3_configHwaCommon(void)
                            HWA_COMMONCONFIG_MASK_FFT1DENABLE |
                            HWA_COMMONCONFIG_MASK_INTERFERENCETHRESHOLD;
     commonCfg.numLoops =
-#ifdef CONFIGURABLE_CAPTURE
         gCapturePlan.chirpsPerFrame / 2U;
-#else
-        CHIRPS_PER_FRAME / 2U;
-#endif
     commonCfg.paramStartIdx = L3_HWA_PARAM_DUMMY_PING;
     commonCfg.paramStopIdx = L3_HWA_PARAM_FFT_PONG;
     commonCfg.fftConfig.fft1DEnable = HWA_FEATURE_BIT_ENABLE;
@@ -1463,139 +1784,33 @@ static int32_t l3_configHwaCommon(void)
 }
 
 #ifdef L3_DUMP_IQ8
-static int8_t l3_quantizeIq8(int16_t sample, uint16_t scale)
-{
-    int32_t value = (int32_t)sample;
-    int32_t half = (int32_t)scale / 2;
-    int32_t quantized;
-
-    if (value >= 0) {
-        quantized = (value + half) / (int32_t)scale;
-    } else {
-        quantized = -((-value + half) / (int32_t)scale);
-    }
-    if (quantized > 127) {
-        quantized = 127;
-    } else if (quantized < -128) {
-        quantized = -128;
-    }
-    return (int8_t)quantized;
-}
+/* Dump-time quantisation: l3_iq8_quantize_scale (l3_iq8.c) is the one
+ * definition, shared with the host emulator. */
 #endif
 
 #ifdef L3_RING_IQ8
 #ifndef L3_IQ8_EDMA_PACK
-#ifdef L3_IQ8_SPARSE_SCALE
-static uint8_t l3_iq8SampledPackShift(const int16_t *source,
-                                      uint32_t components)
-{
-    uint32_t maxAbs = 1U;
-    uint32_t component;
-    uint32_t step = 2U * L3_IQ8_SCALE_COMPLEX_STRIDE;
-    uint8_t shift = 0U;
-
-    for (component = 0U; component + 1U < components; component += step) {
-        int32_t iValue = (int32_t)source[component];
-        int32_t qValue = (int32_t)source[component + 1U];
-        uint32_t iMagnitude =
-            (iValue < 0) ? (uint32_t)(-iValue) : (uint32_t)iValue;
-        uint32_t qMagnitude =
-            (qValue < 0) ? (uint32_t)(-qValue) : (uint32_t)qValue;
-
-        if (iMagnitude > maxAbs) {
-            maxAbs = iMagnitude;
-        }
-        if (qMagnitude > maxAbs) {
-            maxAbs = qMagnitude;
-        }
-    }
-    while (maxAbs > 127U) {
-        maxAbs = (maxAbs + 1U) >> 1U;
-        shift++;
-    }
-    return shift;
-}
-#endif
-
-#ifndef L3_IQ8_SPARSE_SCALE
-static uint8_t l3_iq8PackShift(const int16_t *source, uint32_t components)
-{
-    uint32_t maxAbs = 1U;
-    uint32_t component;
-    uint8_t shift = 0U;
-
-    for (component = 0U; component < components; component++) {
-        int32_t value = (int32_t)source[component];
-        uint32_t magnitude =
-            (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
-        if (magnitude > maxAbs) {
-            maxAbs = magnitude;
-        }
-    }
-    while (maxAbs > 127U) {
-        maxAbs = (maxAbs + 1U) >> 1U;
-        shift++;
-    }
-    return shift;
-}
-#endif
-
-static int8_t l3_quantizeIq8Shift(int16_t sample, uint8_t shift,
-                                  uint32_t *clippedComponents)
-{
-    int32_t value = (int32_t)sample;
-    int32_t quantized;
-
-    if (shift == 0U) {
-        quantized = value;
-    } else {
-        int32_t half = (int32_t)(1U << (shift - 1U));
-        if (value >= 0) {
-            quantized = (value + half) >> shift;
-        } else {
-            quantized = -((-value + half) >> shift);
-        }
-    }
-    if (quantized > 127) {
-        quantized = 127;
-        if (clippedComponents != NULL) {
-            (*clippedComponents)++;
-        }
-    } else if (quantized < -128) {
-        quantized = -128;
-        if (clippedComponents != NULL) {
-            (*clippedComponents)++;
-        }
-    }
-    return (int8_t)quantized;
-}
-
+/* The pack shift and the shift quantiser are l3_iq8_pack_shift and
+ * l3_iq8_quantize_shift (l3_iq8.c): the host emulator compiles the same
+ * arithmetic, so an offline IQ8 is the board's IQ8. */
 static void l3_packIq8CompletedFrame(uint32_t slot, uint8_t scratch)
 {
     const int16_t *source = &g_iq16FrameScratch[scratch][0];
     int8_t *destination = (int8_t *)&g_ring[gFrameOffset[slot]];
     uint32_t components = gFrameBytes[slot];
     uint32_t component;
-#ifdef L3_IQ8_SPARSE_SCALE
     uint32_t clippedComponents = 0U;
-    uint8_t packShift = l3_iq8SampledPackShift(source, components);
+#ifdef L3_IQ8_SPARSE_SCALE
+    uint8_t packShift = l3_iq8_pack_shift(source, components, L3_IQ8_SCALE_COMPLEX_STRIDE);
 #else
-    uint8_t packShift = l3_iq8PackShift(source, components);
+    uint8_t packShift = l3_iq8_pack_shift(source, components, 1U);
 #endif
 
     for (component = 0U; component < components; component++) {
-#ifdef L3_IQ8_SPARSE_SCALE
         destination[component] =
-            l3_quantizeIq8Shift(source[component], packShift,
-                                &clippedComponents);
-#else
-        destination[component] =
-            l3_quantizeIq8Shift(source[component], packShift, NULL);
-#endif
+            l3_iq8_quantize_shift(source[component], packShift, &clippedComponents);
     }
-#ifdef L3_IQ8_SPARSE_SCALE
     gIq8ClippedComponents += clippedComponents;
-#endif
     gFrameIq8Scale[slot] =
         (uint16_t)(L3_IQ8_HWA_SCALE << packShift);
     gIq8PackFrames++;
@@ -1610,6 +1825,13 @@ static void l3_iq8EdmaDoneCB(uintptr_t arg, uint8_t tcCode)
         gIq8EdmaBusy[scratch] = 0U;
         gIq8EdmaDone++;
         gIq8PackFrames++;
+        if (gIq8PackDetectArm[scratch] != 0U) {
+            uint32_t packedSlot = gIq8PackDetectSlot[scratch];
+            uint32_t packedEpoch = gIq8PackDetectEpoch[scratch];
+
+            gIq8PackDetectArm[scratch] = 0U;
+            l3_publishDetectFrame(packedSlot, packedEpoch);
+        }
     } else {
         gIq8EdmaErrors++;
     }
@@ -1681,6 +1903,7 @@ static int32_t l3_startIq8EdmaPack(uint32_t slot, uint8_t scratch)
     }
     if (errCode != EDMA_NO_ERROR) {
         gIq8EdmaBusy[scratch] = 0U;
+        gIq8PackDetectArm[scratch] = 0U;
         gIq8EdmaErrors++;
         return -1;
     }
@@ -1708,9 +1931,106 @@ static void l3_waitForAllIq8Edma(void)
 #endif
 #endif
 
+#ifdef L3_RING_IQ8
+/* What the retention policy needs to know when a frame completes: the shot
+ * machine's state and the trackers' predictions for the coming frame. Read
+ * on the rearm task while the detect task may be updating them: a bin off
+ * in the window's placement at worst, never a wrong frame. */
+static void l3_retainState(uint32_t slot, l3_retain_state_t *state)
+{
+    uint32_t ballBin = gTrigCfg.teeBin;
+
+    memset(state, 0, sizeof(*state));
+    state->shotState = gShot.state;
+    if (l3_ball_locked(&gBall, &ballBin)) {
+        state->ballLocked = 1U;
+    } else {
+        ballBin = gTrigCfg.teeBin;
+    }
+    state->ballBin = (float)ballBin;
+    state->clubActive = gClubTrack.active;
+    state->clubBin = l3_retain_predict(gClubTrack.lastBin, gClubTrack.velocityBinsPerFrame);
+    if (slot >= gCapturePlan.preFrames) {
+        state->postFrame = 1U;
+        state->postIndex = slot - gCapturePlan.preFrames;
+    }
+    state->ballTrackConfirmed = gBallTrack.confirmed;
+    state->ballTrackBin =
+        l3_retain_predict(gBallTrack.core.lastBin, gBallTrack.core.velocityBinsPerFrame);
+}
+
+/* Copy the retained IQ16 window of a completed processing frame from its
+ * scratch into the slot, and record what the slot now holds. The slot's
+ * width is the plan's per-phase retain width; only the start moves. */
+static void l3_compactCompletedFrame(uint32_t slot, uint8_t scratch)
+{
+    l3_retain_state_t state;
+    l3_retain_window_t window;
+    l3_frame_desc_t *desc;
+    uint32_t processStart;
+    uint32_t processBins;
+    uint32_t ticks = Cycleprofiler_getTimeStamp();
+    uint32_t elapsedUs;
+
+    if (slot >= gCapturePlan.totalFrames || scratch >= 2U) {
+        gCompactErrors++;
+        return;
+    }
+    processStart = gFrameProcessStart[slot];
+    processBins = gFrameProcessBins[slot];
+    l3_ensureRetainCfg();
+    l3_retainState(slot, &state);
+    l3_retain_window(&gRetainCfg, &state, processStart, processBins, gFrameBinCount[slot],
+                     &window);
+    if (l3_compact_iq16(&g_iq16FrameScratch[scratch][0],
+                        (int16_t *)(void *)&g_ring[gFrameOffset[slot]],
+                        gCapturePlan.chirpsPerFrame, N_RX, (uint16_t)processBins,
+                        (uint16_t)(window.start - processStart), window.bins) != 0) {
+        gCompactErrors++;
+        return;
+    }
+    gFrameBinStart[slot] = window.start;
+    gFrameBinCount[slot] = window.bins;
+    gLastRetain = window;
+    desc = &gFrameDesc[slot];
+    desc->frame = (uint16_t)(state.postFrame ? gPreFramesCaptured + state.postIndex + 1U
+                                              : gPreFramesCaptured);
+    desc->timestampUs = (uint32_t)desc->frame * gFramePeriodUs;
+    desc->dataOffset = gFrameOffset[slot];
+    desc->bytes = gFrameBytes[slot];
+    desc->globalBinStart = window.start;
+    desc->binCount = window.bins;
+    desc->processStart = (uint8_t)processStart;
+    desc->processBins = (uint8_t)processBins;
+    desc->shotState = state.shotState;
+    desc->priority = window.priority;
+    desc->why = window.why;
+    desc->isPost = state.postFrame;
+    gCompactFrames++;
+    elapsedUs = (Cycleprofiler_getTimeStamp() - ticks) / (gCpuClock / 1000000U);
+    if (elapsedUs > gCompactMaxUs) {
+        gCompactMaxUs = elapsedUs;
+    }
+}
+
+/* A completed scratch frame into L3: IQ8 packs it, the compact formats keep
+ * the retained IQ16 window. */
+static void l3_storeCompletedFrame(uint32_t slot, uint8_t scratch)
+{
+    if (l3_captureCompactsIq16()) {
+        l3_compactCompletedFrame(slot, scratch);
+        return;
+    }
+#ifdef L3_IQ8_EDMA_PACK
+    (void)l3_startIq8EdmaPack(slot, scratch);
+#else
+    l3_packIq8CompletedFrame(slot, scratch);
+#endif
+}
+#endif
+
 static uint32_t l3_snapshotBinStartForNextFrame(void)
 {
-#ifdef CONFIGURABLE_CAPTURE
     if (!gPostCaptureStarted) {
         return gCapturePlan.preStart;
     }
@@ -1726,22 +2046,6 @@ static uint32_t l3_snapshotBinStartForNextFrame(void)
         return gCapturePlan.postStart;
     }
     return gCapturePlan.lateStart;
-#else
-#ifdef SNAPSHOT_DYNAMIC_WINDOWS
-    uint32_t completedAfterRequest;
-
-    if (!gHwaFreezeRequested) {
-        return SNAPSHOT_BIN_START;
-    }
-    completedAfterRequest = gRingFrame - gHwaFreezeRequestFrame;
-    if (completedAfterRequest < (HWA_POST_TRIGGER_FRAMES / 2U)) {
-        return SNAPSHOT_MIDDLE_BIN_START;
-    }
-    return SNAPSHOT_LATE_BIN_START;
-#else
-    return SNAPSHOT_BIN_START;
-#endif
-#endif
 }
 
 static int32_t l3_configHwaFrameOutput(uint32_t ringSlot)
@@ -1754,7 +2058,6 @@ static int32_t l3_configHwaFrameOutput(uint32_t ringSlot)
     uint32_t pongSource = SOC_XWR68XX_MSS_HWA_MEM2_BASE_ADDRESS + HWA_MEM_STRIDE +
                           binStart * HWA_COMPLEX16_BYTES;
 
-#ifdef CONFIGURABLE_CAPTURE
     if (gPostCaptureStarted) {
         ringSlot = gCapturePlan.preFrames + gPostFramesCaptured;
         gActiveFrameIsPost = 1U;
@@ -1781,18 +2084,18 @@ static int32_t l3_configHwaFrameOutput(uint32_t ringSlot)
         return -1;
     }
 #ifdef L3_RING_IQ8
-    destination = l3_captureUsesIq8()
+    destination = l3_captureUsesScratch()
                       ? (uint32_t)&g_iq16FrameScratch[gIq8ActiveScratch][0]
                       : (uint32_t)&g_ring[gFrameOffset[ringSlot]];
+    if (l3_captureUsesScratch()) {
+        /* From here the scratch belongs to the HWA: a detect frame still
+         * being read from it is stale (l3_detectFrameStale). */
+        gScratchBusy[gIq8ActiveScratch] = 1U;
+    }
+    gActiveProcessStart = (uint8_t)binStart;
+    gActiveProcessBins = (uint8_t)binCount;
 #else
     destination = (uint32_t)&g_ring[gFrameOffset[ringSlot]];
-#endif
-#else
-    binCount = SNAPSHOT_BINS;
-    destination = (uint32_t)&g_ring[ringSlot % RING_FRAMES][0];
-#ifdef SNAPSHOT_DYNAMIC_WINDOWS
-    gFrameBinStart[ringSlot % RING_FRAMES] = (uint8_t)binStart;
-#endif
 #endif
 
     (void)EDMA_disableChannel(gEdmaHandle, L3_HWA_OUT_PING_CHANNEL,
@@ -1838,11 +2141,7 @@ static int32_t l3_restartCompletedHwaFrame(void)
     errCode = l3_configHwaCommon();
     if (errCode == 0) {
         errCode =
-#ifdef CONFIGURABLE_CAPTURE
             l3_configHwaFrameOutput(0U);
-#else
-            l3_configHwaFrameOutput(gRingFrame % RING_FRAMES);
-#endif
     }
     if (errCode == 0) {
         errCode = HWA_enableDoneInterrupt(gHwaHandle, l3_hwaChainDoneCB, NULL);
@@ -1866,15 +2165,10 @@ static int32_t l3_freezeHwaAfterPostFrames(void)
     key = Hwi_disable();
     gHwaFreezeRequested = 1U;
     gHwaFreezeRequestFrame = gRingFrame;
-#ifdef CONFIGURABLE_CAPTURE
     gPostCaptureStarted = 0U;
     gPostFramesCaptured = 0U;
     gPostFramesObserved = 0U;
     gActiveFrameShouldKeep = 1U;
-    gHwaFreezeTargetFrame = 0U;
-#else
-    gHwaFreezeTargetFrame = gRingFrame + HWA_POST_TRIGGER_FRAMES;
-#endif
     gHwaFreezeRequests++;
     Hwi_restore(key);
     /* Allow the configured post-trigger frames plus scheduling/stop margin. */
@@ -2011,6 +2305,21 @@ static int32_t l3_armHwaChain(void)
     if (errCode != 0) {
         return errCode;
     }
+    if (gRangeWindow == L3_RANGE_WINDOW_HANN) {
+        /* The first half, mirrored by HWA_FFT_WINDOW_SYMMETRIC; offset and
+         * size in bytes, as TI's range processing loads it. */
+        uint32_t coeffs = l3_window_hann_q17(gRangeWindowCoeffs, N_SAMPLES);
+
+        if (coeffs == 0U) {
+            return -1;
+        }
+        errCode = HWA_configRam(gHwaHandle, HWA_RAM_TYPE_WINDOW_RAM,
+                                (uint8_t *)gRangeWindowCoeffs,
+                                coeffs * (uint32_t)sizeof(int32_t), 0U);
+        if (errCode != 0) {
+            return errCode;
+        }
+    }
 
     memset((void *)&dummyCfg, 0, sizeof(dummyCfg));
     dummyCfg.triggerMode = HWA_TRIG_MODE_DMA;
@@ -2064,10 +2373,14 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
 #ifdef L3_RING_IQ8
             uint8_t hadPending = 0U;
             uint8_t pendingScratch = 0U;
+            uint8_t pendingDetect = 0U;
             uint8_t nextScratch = 0U;
             uint32_t pendingSlot = 0U;
+            uint32_t pendingEpoch = 0U;
 #endif
             int32_t errCode;
+            uint32_t queuedCycles;
+            uint8_t timed;
 
             key = Hwi_disable();
             if (gCaptureActive) {
@@ -2089,7 +2402,7 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
             }
             Hwi_restore(key);
 #else
-            if (!l3_captureUsesIq8()) {
+            if (!l3_captureUsesScratch()) {
                 key = Hwi_disable();
                 if (gHwaShutdownRequested) {
                     gCaptureActive = 0U;
@@ -2101,22 +2414,28 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
             }
 #endif
 #ifdef L3_RING_IQ8
-            if (l3_captureUsesIq8()) {
+            if (l3_captureUsesScratch()) {
                 key = Hwi_disable();
                 if (gIq8Pending) {
                     hadPending = 1U;
                     pendingSlot = gIq8PendingSlot;
                     pendingScratch = gIq8PendingScratch;
+                    pendingDetect = gIq8PendingDetect;
+                    pendingEpoch = gIq8PendingEpoch;
                     gIq8Pending = 0U;
+                    gIq8PendingDetect = 0U;
+#ifdef L3_IQ8_EDMA_PACK
+                    gIq8PackDetectArm[pendingScratch] = pendingDetect;
+                    gIq8PackDetectSlot[pendingScratch] = (uint16_t)pendingSlot;
+                    gIq8PackDetectEpoch[pendingScratch] = pendingEpoch;
+#endif
                 }
                 if (gHwaShutdownRequested) {
                     gCaptureActive = 0U;
                     gHwaShutdownRequested = 0U;
                     gHwaRearmPending = 0U;
                     freezeAfterPack = 1U;
-                } else if (gHwaFreezeRequested && gActiveFrameIsPost &&
-                    gActiveFrameShouldKeep &&
-                    gPostFramesCaptured >= gCapturePlan.postFrames) {
+                } else if (l3_shouldFreezeNow()) {
                     gCaptureActive = 0U;
                     gHwaFreezeRequested = 0U;
                     gHwaFreezeCompletions++;
@@ -2134,11 +2453,7 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
             if (freezeAfterPack) {
 #ifdef L3_RING_IQ8
                 if (hadPending) {
-#ifdef L3_IQ8_EDMA_PACK
-                    (void)l3_startIq8EdmaPack(pendingSlot, pendingScratch);
-#else
-                    l3_packIq8CompletedFrame(pendingSlot, pendingScratch);
-#endif
+                    l3_storeCompletedFrame(pendingSlot, pendingScratch);
                 }
 #ifdef L3_IQ8_EDMA_PACK
                 if (l3_captureUsesIq8()) {
@@ -2158,20 +2473,42 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
             if (l3_captureUsesIq8()) {
                 l3_waitForIq8EdmaScratch(nextScratch);
                 gIq8ActiveScratch = nextScratch;
+            } else if (l3_captureCompactsIq16()) {
+                /* The compaction is synchronous and happens after the HWA
+                 * restart below, so the scratch it reads is the one the HWA
+                 * is NOT writing: toggle first, compact from the other. */
+                gIq8ActiveScratch = nextScratch;
             }
 #endif
+            key = Hwi_disable();
+            queuedCycles = gHwaRearmQueuedCycles;
+            timed = gHwaRearmQueuedValid;
+            gHwaRearmQueuedValid = 0U;
+            Hwi_restore(key);
             errCode = l3_restartCompletedHwaFrame();
+            if (timed) {
+                uint32_t elapsedUs = (Cycleprofiler_getTimeStamp() - queuedCycles) /
+                                     (gCpuClock / 1000000U);
+                gHwaRearmLastUs = elapsedUs;
+                if (elapsedUs > gHwaRearmMaxUs) {
+                    gHwaRearmMaxUs = elapsedUs;
+                }
+                gHwaRearmTimed++;
+            }
             if (errCode == 0) {
                 gHwaRearms++;
             } else {
                 gHwaRearmErrors++;
             }
 #ifdef L3_RING_IQ8
-            if (l3_captureUsesIq8() && hadPending) {
-#ifdef L3_IQ8_EDMA_PACK
-                (void)l3_startIq8EdmaPack(pendingSlot, pendingScratch);
-#else
-                l3_packIq8CompletedFrame(pendingSlot, pendingScratch);
+            if (l3_captureUsesScratch() && hadPending) {
+                l3_storeCompletedFrame(pendingSlot, pendingScratch);
+#ifndef L3_IQ8_EDMA_PACK
+                if (pendingDetect != 0U && l3_captureUsesIq8()) {
+                    /* Pre slots to the trigger, kept post slots (post epoch)
+                     * to the ball tracker. */
+                    l3_publishDetectFrame(pendingSlot, pendingEpoch);
+                }
 #endif
             }
 #endif
@@ -2191,15 +2528,10 @@ static void l3_fill_header(l3_dump_header_t *h, uint16_t n_frames,
     h->version          = L3_DUMP_VERSION;
     h->n_frames         = n_frames;
     h->chirps_per_frame =
-#ifdef CONFIGURABLE_CAPTURE
         gCapturePlan.chirpsPerFrame;
-#else
-        CHIRPS_PER_FRAME;
-#endif
     h->n_tx             = N_TX;
     h->n_rx             = N_RX;
 #ifdef SNAPSHOT_DUMP
-#ifdef CONFIGURABLE_CAPTURE
 #ifdef HYBRID_CADENCE_CAPTURE
     h->version          = L3_DUMP_VERSION_TIMED;
 #ifdef L3_DUMP_IQ8
@@ -2222,18 +2554,18 @@ static void l3_fill_header(l3_dump_header_t *h, uint16_t n_frames,
     if (gCapturePlan.postBins > h->n_samples) {
         h->n_samples = gCapturePlan.postBins;
     }
+    if (gCapturePlan.compact) {
+        /* The payload holds the retained windows: their widest is the
+         * maximum frame width the decoder sizes for. */
+        h->n_samples = gCapturePlan.retainPreBins;
+        if (gCapturePlan.phased && gCapturePlan.retainImpactBins > h->n_samples) {
+            h->n_samples = gCapturePlan.retainImpactBins;
+        }
+        if (gCapturePlan.retainPostBins > h->n_samples) {
+            h->n_samples = gCapturePlan.retainPostBins;
+        }
+    }
     h->_pad             = 0U;
-#else
-    h->n_samples        = SNAPSHOT_BINS;
-#ifdef SNAPSHOT_DYNAMIC_WINDOWS
-    h->version          = L3_DUMP_VERSION_WINDOWED;
-    h->sample_fmt       = L3_SAMPLE_RANGE_FFT_IQ16_WINDOWED;
-    h->_pad             = 0U;
-#else
-    h->sample_fmt       = L3_SAMPLE_RANGE_FFT_IQ16;
-    h->_pad             = SNAPSHOT_BIN_START;
-#endif
-#endif
 #else
     h->n_samples        = SAVE_SAMPLES;
     h->sample_fmt       = L3_SAMPLE_INT16_IQ;
@@ -2243,7 +2575,6 @@ static void l3_fill_header(l3_dump_header_t *h, uint16_t n_frames,
     h->frame_period_us  = gFramePeriodUs;
 }
 
-#ifdef CONFIGURABLE_CAPTURE
 static void l3_writeFrameDescriptor(uint32_t slot, uint8_t firstFrame)
 {
 #ifdef HYBRID_CADENCE_CAPTURE
@@ -2264,29 +2595,18 @@ static void l3_writeFrameDescriptor(uint32_t slot, uint8_t firstFrame)
     UART_writePolling(gDataUart, descriptor, sizeof(descriptor));
 #endif
 }
-#endif
 
-#if defined(CONFIGURABLE_CAPTURE) && defined(L3_DUMP_IQ8)
+#if defined(L3_DUMP_IQ8)
 static uint16_t l3_iq8FrameScale(uint32_t slot)
 {
     const int16_t *src = (const int16_t *)&g_ring[gFrameOffset[slot]];
     uint32_t words = gFrameBytes[slot] / (uint32_t)sizeof(int16_t);
-    uint32_t maxAbs = 1U;
-    uint32_t word;
 
-    for (word = 0U; word < words; word++) {
-        int32_t value = (int32_t)src[word];
-        uint32_t magnitude =
-            (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
-        if (magnitude > maxAbs) {
-            maxAbs = magnitude;
-        }
-    }
-    return (uint16_t)((maxAbs + 126U) / 127U);
+    return l3_iq8_dump_scale(l3_iq8_max_abs(src, words));
 }
 #endif
 
-#if defined(CONFIGURABLE_CAPTURE) && defined(L3_ANY_IQ8)
+#if defined(L3_ANY_IQ8)
 static void l3_writeU16Le(uint16_t value)
 {
     uint8_t out[2];
@@ -2297,7 +2617,7 @@ static void l3_writeU16Le(uint16_t value)
 }
 #endif
 
-#if defined(CONFIGURABLE_CAPTURE) && defined(L3_DUMP_IQ8)
+#if defined(L3_DUMP_IQ8)
 static void l3_writeCompressedIq8Frame(uint32_t slot, uint16_t scale)
 {
     const int16_t *src = (const int16_t *)&g_ring[gFrameOffset[slot]];
@@ -2307,7 +2627,7 @@ static void l3_writeCompressedIq8Frame(uint32_t slot, uint16_t scale)
     uint32_t word;
 
     for (word = 0U; word < words; word++) {
-        out[pending++] = (uint8_t)l3_quantizeIq8(src[word], scale);
+        out[pending++] = (uint8_t)l3_iq8_quantize_scale(src[word], scale);
         if (pending == sizeof(out)) {
             UART_writePolling(gDataUart, out, pending);
             pending = 0U;
@@ -2349,20 +2669,7 @@ static int32_t l3_readTemperatureReport(l3_temperature_report_t *report)
 static void l3_edmaCB(uintptr_t arg, uint8_t tcCode)
 {
     (void)arg; (void)tcCode;
-#ifdef LIVE_SNAPSHOT_RING
-    {
-        uintptr_t key;
-        uint32_t bit = 1U << (uint32_t)arg;
-        key = Hwi_disable();
-        if ((gRawFrameReadyMask & bit) != 0U) {
-            gRawFrameDrops++;
-        }
-        gRawFrameReadyMask |= bit;
-        Hwi_restore(key);
-    }
-#else
     gNumWrap++;
-#endif
 }
 #endif
 
@@ -2380,7 +2687,7 @@ static void l3_frameStartISR(uintptr_t arg)
         gHwaArmedForFrame = 0U;
     }
 #endif
-#if !defined(LIVE_SNAPSHOT_RING) && !defined(HWA_CHAINED_SNAPSHOT_RING)
+#if !defined(HWA_CHAINED_SNAPSHOT_RING)
     gRingFrame++;
 #endif
 }
@@ -2417,6 +2724,8 @@ static uint8_t l3_dumpCancelRequested(void)
     return (value == L3_DUMP_CANCEL_BYTE) ? 1U : 0U;
 }
 
+static int32_t l3_awaitFrozenRing(void);
+
 /* CLI "l3dump": record the current circular position, retain the configured
  * post-trigger frames, stop at that completed frame boundary, stream the ring,
  * then restart from slot zero. */
@@ -2425,26 +2734,22 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
     l3_dump_header_t h;
     uint32_t         i;
     uint8_t          dumpCancelled = 0U;
-#ifdef CONFIGURABLE_CAPTURE
     uint32_t actualPre;
     uint32_t actualPost;
     uint32_t oldestPre;
-#endif
     (void)argc; (void)argv;
 
-    if (!gCaptureActive) {
-        return -1;
-    }
-
-    /* Halt chirping only after HWA and both output EDMAs completed naturally. */
-    if (l3_stopCaptureAtBoundary() != 0) {
+    /* Halt chirping only after HWA and both output EDMAs completed naturally.
+     * A self-trigger's own freeze is taken here, clearing its latch: a second
+     * request would restart its post tail, and the stale latch would send the
+     * next l3release waiting on a freeze this restart never brings. */
+    if (l3_awaitFrozenRing() != 0) {
         return -1;
     }
 
     /* Oldest slot = time-order start (best-effort: a frame-start ISR racing
      * the stop can skew this by one; the host cross-checks with its own
      * rotation solve). Before the first wrap the oldest data is slot 0. */
-#ifdef CONFIGURABLE_CAPTURE
     actualPre = (gPreFramesCaptured < gCapturePlan.preFrames)
                     ? gPreFramesCaptured : gCapturePlan.preFrames;
     actualPost = (gPostFramesCaptured < gCapturePlan.postFrames)
@@ -2452,11 +2757,6 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
     oldestPre = (gPreFramesCaptured >= gCapturePlan.preFrames)
                     ? (gPreFramesCaptured % gCapturePlan.preFrames) : 0U;
     l3_fill_header(&h, (uint16_t)(actualPre + actualPost), 0U);
-#else
-    l3_fill_header(&h, RING_FRAMES,
-                   (gRingFrame >= RING_FRAMES)
-                       ? (uint16_t)(gRingFrame % RING_FRAMES) : 0U);
-#endif
     {
         l3_temperature_report_t tempReport;
         int32_t tempStatus;
@@ -2464,18 +2764,30 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
         memset((void *)&tempReport, 0, sizeof(tempReport));
         tempStatus = l3_readTemperatureReport(&tempReport);
         if (tempStatus == 0) {
-#ifdef CONFIGURABLE_CAPTURE
-            h.version = L3_DUMP_VERSION_CAPTURE_TEMPERATURE;
-#else
-            h.version = L3_DUMP_VERSION_TEMPERATURE;
-#endif
+            /* v10: v7 plus the clutter map, so a replay starts from what the
+             * board had learned at address (dump_format.h). */
+            h.version = L3_DUMP_VERSION_CLUTTER;
         }
         UART_writePolling(gDataUart, (uint8_t *)&h, sizeof(h));
         if (tempStatus == 0) {
+            l3_clutter_report_t clutter;
+            uint32_t mapBins = (gBandNoise.count <= L3_BAND_NOISE_BINS) ? gBandNoise.count
+                                                                         : L3_BAND_NOISE_BINS;
+
             UART_writePolling(gDataUart, (uint8_t *)&tempReport, sizeof(tempReport));
+            clutter.firstBin = (uint16_t)gBandNoise.firstBin;
+            clutter.count = (uint16_t)mapBins;
+            clutter.updates = gBandNoise.updates;
+            clutter.rangeWindow = gRangeWindow;
+            memset((void *)clutter._reserved, 0, sizeof(clutter._reserved));
+            UART_writePolling(gDataUart, (uint8_t *)&clutter, sizeof(clutter));
+            if (mapBins > 0U) {
+                UART_writePolling(gDataUart, (uint8_t *)gBandNoise.avg, mapBins * sizeof(float));
+                UART_writePolling(gDataUart, (uint8_t *)gBandNoise.dev, mapBins * sizeof(float));
+                UART_writePolling(gDataUart, (uint8_t *)gBandNoise.seen, mapBins);
+            }
         }
     }
-#ifdef CONFIGURABLE_CAPTURE
     for (i = 0U; i < actualPre; i++) {
         uint32_t slot = (oldestPre + i) % gCapturePlan.preFrames;
         l3_writeFrameDescriptor(slot, (i == 0U));
@@ -2515,14 +2827,8 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
         }
     }
 #endif
-#else
-#ifdef SNAPSHOT_DYNAMIC_WINDOWS
-    UART_writePolling(gDataUart, gFrameBinStart, sizeof(gFrameBinStart));
-#endif
-#endif
 #ifdef SNAPSHOT_DUMP
-#if defined(LIVE_SNAPSHOT_RING) || defined(HWA_CHAINED_SNAPSHOT_RING)
-#ifdef CONFIGURABLE_CAPTURE
+#if defined(HWA_CHAINED_SNAPSHOT_RING)
     for (i = 0U; i < actualPre; i++) {
         uint32_t slot = (oldestPre + i) % gCapturePlan.preFrames;
 #ifdef L3_RING_IQ8
@@ -2556,11 +2862,6 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
         }
     }
 #else
-    for (i = 0; i < RING_FRAMES; i++) {
-        UART_writePolling(gDataUart, (uint8_t *)g_ring[i], sizeof(g_ring[i]));
-    }
-#endif
-#else
     if (!gHwaOpened || gHwaHandle == NULL) {
         CLI_write("Error: HWA unavailable for snapshot dump\n");
         gCaptureActive = 0U;
@@ -2587,15 +2888,14 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
 #ifdef HWA_CHAINED_SNAPSHOT_RING
     gRingFrame = 0U;
     gHwaFreezeRequestFrame = 0U;
-    gHwaFreezeTargetFrame = 0U;
-#ifdef CONFIGURABLE_CAPTURE
     gPreFramesCaptured = 0U;
+    l3_trigRearm();
     gPostFramesCaptured = 0U;
     gPostFramesObserved = 0U;
     gPostCaptureStarted = 0U;
     gActiveFrameIsPost = 0U;
     gActiveFrameShouldKeep = 1U;
-#endif
+    l3_resetDetectQueue();
     if (l3_restartCompletedHwaFrame() < 0) {
         CLI_write("Error: completed HWA frame restart failed\n");
         gCaptureActive = 0U;
@@ -2612,14 +2912,6 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
 #ifndef HWA_CHAINED_SNAPSHOT_RING
     gRingFrame = 0U;
 #endif
-#ifdef LIVE_SNAPSHOT_RING
-    gRawFrameReadyMask = 0U;
-    gRawFrameDrops     = 0U;
-    gSnapshotFrames    = 0U;
-    gSnapshotErrors    = 0U;
-    gSnapshotBusy      = 0U;
-    gHwaFftConfigured  = 0U;
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
     gCaptureActive = 1U;
 #endif
@@ -2634,21 +2926,2889 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
     return 0;
 }
 
-/* CLI "stats": report capture counters (diagnostic). */
+/* CLI "l3sparse": freeze, stream vertical residual power, then the complex
+ * cells the host names. The host falls back to l3dump when this command
+ * returns an error before the freeze. */
+static void l3_writeU16(uint16_t value)
+{
+    uint8_t bytes[2];
+
+    bytes[0] = (uint8_t)(value & 0xFFU);
+    bytes[1] = (uint8_t)(value >> 8U);
+    UART_writePolling(gDataUart, bytes, sizeof(bytes));
+}
+
+static void l3_writeF32(float value)
+{
+    uint32_t bits;
+    uint8_t bytes[4];
+
+    memcpy(&bits, &value, sizeof(bits));
+    bytes[0] = (uint8_t)(bits & 0xFFU);
+    bytes[1] = (uint8_t)((bits >> 8U) & 0xFFU);
+    bytes[2] = (uint8_t)((bits >> 16U) & 0xFFU);
+    bytes[3] = (uint8_t)((bits >> 24U) & 0xFFU);
+    UART_writePolling(gDataUart, bytes, sizeof(bytes));
+}
+
+/* Read one CLI line into buf through the UART driver's interrupt receive.
+ * Returns 0 on a line, -1 on timeout, -3 on an empty line, and -2 when the
+ * line does not fit: the rest of it is then read and discarded so none of it
+ * reaches the CLI parser as a command.
+ *
+ * The SCI receiver holds one byte. Polling it from this task lost bytes
+ * whenever the HWA rearm task (above the CLI) ran mid-line, and a host cell
+ * line spans several frames; the driver's RX interrupt captures each byte
+ * regardless of which task is running. The CLI handle reads TEXT with newline
+ * return, so UART_read completes at '\n' (a CR is folded into one). */
+#define L3_READLINE_OVERFLOW (-2)
+#define L3_READLINE_EMPTY (-3)
+/* Bytes of an overlong line drained before giving up: 48 KB, about 4 s at
+ * the CLI baud, far past any real request. */
+#define L3_READLINE_DRAIN_MAX (64U * L3_SPARSE_REQUEST_MAX)
+
+static int32_t l3_readLine(char *buf, uint32_t cap)
+{
+    UART_Config *uartConfig = (UART_Config *)gCliUart;
+    UartSci_Driver *driver;
+    uint32_t savedTimeout;
+    uint32_t drained = 0U;
+    int32_t count;
+    int32_t status;
+
+    if (uartConfig == NULL || uartConfig->object == NULL || cap < 2U) {
+        return -1;
+    }
+    /* The handle's read timeout is the CLI's (forever). A missing request
+     * must not freeze the ring for good, so bound this one read. */
+    driver = (UartSci_Driver *)uartConfig->object;
+    savedTimeout = driver->params.readTimeout;
+    driver->params.readTimeout = L3_SPARSE_REQUEST_TIMEOUT_MS;
+
+    count = UART_read(gCliUart, (uint8_t *)buf, cap - 1U);
+    if (count <= 0) {
+        buf[0] = '\0';
+        status = -1;
+    } else if (buf[count - 1] == '\n') {
+        buf[count - 1] = '\0';
+        status = (count == 1) ? L3_READLINE_EMPTY : 0;
+    } else {
+        /* The buffer filled before a newline: the line does not fit. Drain
+         * the rest of it so none of it reaches the CLI parser as commands.
+         * Each read is bounded by the request timeout; the byte bound only
+         * stops a stream that never ends, and must cover any request a host
+         * could plausibly send (a 4x oversized cell line is ~4 KB, which the
+         * old 4 x cap bound left half of in the FIFO). */
+        buf[cap - 1U] = '\0';
+        while (drained < L3_READLINE_DRAIN_MAX) {
+            uint8_t scratch[32];
+
+            count = UART_read(gCliUart, scratch, sizeof(scratch));
+            if (count <= 0) {
+                break;
+            }
+            drained += (uint32_t)count;
+            if (scratch[count - 1] == '\n') {
+                break;
+            }
+        }
+        status = L3_READLINE_OVERFLOW;
+    }
+
+    driver->params.readTimeout = savedTimeout;
+    return status;
+}
+
+static const int16_t *l3_iq16Sample(
+    uint32_t slot, uint32_t chirp, uint32_t rx, uint32_t localBin)
+{
+    const int16_t *frame = (const int16_t *)&g_ring[gFrameOffset[slot]];
+    uint32_t binCount = gFrameBinCount[slot];
+    uint32_t index = ((chirp * N_RX) + rx) * binCount + localBin;
+
+    return &frame[index * 2U];
+}
+
+/* Samples for the detect path: int16 (Im, Re) pairs in IQ16, int8 pairs
+ * times the frame's scale in IQ8 (see gFrameIq8Scale), so the trigger, the
+ * trackers and the ball detector read either ring. Each component is
+ * l3_ringComponentBytes() wide; a complex sample is two of them. In the
+ * compact IQ16 formats a detect frame is the wide processing window in the
+ * IQ16 scratch, not the retained window in the ring: l3_detectFrameOf says
+ * where a slot's frame is, l3_detectFrameStale whether it is still there. */
+typedef struct {
+    const uint8_t *base;
+    uint32_t binStart;   /* global bin of the first sample */
+    uint32_t binCount;
+    uint32_t cb;         /* bytes per component */
+    float    scale;      /* physical amplitude per stored unit */
+    uint8_t  scratch;    /* L3_SCRATCH_NONE when the frame is in the ring */
+    uint32_t epoch;      /* the scratch's completion count when this was taken */
+} l3_detect_frame_t;
+
+static uint32_t l3_ringComponentBytes(void)
+{
+    return l3_captureUsesIq8() ? 1U : 2U;
+}
+
+static float l3_ringScale(uint32_t slot)
+{
+#ifdef L3_RING_IQ8
+    if (l3_captureUsesIq8()) {
+        return (float)gFrameIq8Scale[slot];
+    }
+#else
+    (void)slot;
+#endif
+    return 1.0F;
+}
+
+/* The slot's frame as stored in the ring (the retained window). */
+static l3_detect_frame_t l3_ringFrameOf(uint32_t slot)
+{
+    l3_detect_frame_t frame;
+
+    frame.base = &g_ring[gFrameOffset[slot]];
+    frame.binStart = gFrameBinStart[slot];
+    frame.binCount = gFrameBinCount[slot];
+    frame.cb = l3_ringComponentBytes();
+    frame.scale = l3_ringScale(slot);
+    frame.scratch = L3_SCRATCH_NONE;
+    frame.epoch = 0U;
+    return frame;
+}
+
+/* The slot's frame as the detect task should read it: the wide IQ16
+ * processing window in the scratch for the compact formats, else the ring. */
+static l3_detect_frame_t l3_detectFrameOf(uint32_t slot)
+{
+#ifdef L3_RING_IQ8
+    if (l3_captureCompactsIq16() && slot < L3_MAX_CAPTURE_FRAMES &&
+        gFrameScratch[slot] < 2U) {
+        l3_detect_frame_t frame;
+
+        frame.scratch = gFrameScratch[slot];
+        frame.base = (const uint8_t *)&g_iq16FrameScratch[frame.scratch][0];
+        frame.binStart = gFrameProcessStart[slot];
+        frame.binCount = gFrameProcessBins[slot];
+        frame.cb = 2U;
+        frame.scale = 1.0F;
+        frame.epoch = gScratchFrame[frame.scratch];
+        return frame;
+    }
+#endif
+    return l3_ringFrameOf(slot);
+}
+
+/* 1, counted, when what a detect frame was read from has been rewritten
+ * since it was taken: the observations just computed from it may mix two
+ * frames and must not drive a decision. Its ring slot, when the writer
+ * reached it during the read (checked again with the rule the detect task
+ * popped it by, detect_queue.h); or the scratch it was read from, when that
+ * was handed back to the HWA (or completed another frame). */
+static int32_t l3_detectFrameStale(const l3_detect_frame_t *frame)
+{
+    if (gDetectRingEpoch != L3_DETECT_POST_EPOCH &&
+        !l3detect_slot_live(gDetectRingEpoch, gPreFramesCaptured, gCapturePlan.preFrames)) {
+        gDetectStaleAfterRead++;
+        gDetectEvent.flags |= (uint8_t)L3_TIMING_FLAG_STALE;
+        return 1;
+    }
+#ifdef L3_RING_IQ8
+    if (frame->scratch != L3_SCRATCH_NONE &&
+        (gScratchBusy[frame->scratch] || gScratchFrame[frame->scratch] != frame->epoch)) {
+        gDetectScratchStale++;
+        gDetectEvent.flags |= (uint8_t)L3_TIMING_FLAG_STALE;
+        return 1;
+    }
+#else
+    (void)frame;
+#endif
+    return 0;
+}
+
+/* A detect frame as the per-channel loops read it (l3_channels.h). */
+static l3_channel_frame_t l3_channelFrame(const l3_detect_frame_t *source)
+{
+    l3_channel_frame_t frame;
+
+    frame.base = source->base;
+    frame.binCount = source->binCount;
+    frame.cb = source->cb;
+    frame.scale = source->scale;
+    frame.ntx = (gCapturePlan.loops == 0U) ? 0U
+                                           : gCapturePlan.chirpsPerFrame / gCapturePlan.loops;
+    frame.nrx = N_RX;
+    frame.loops = gCapturePlan.loops;
+    frame.loopPeriodS = gTrigLoopPeriodS;
+    return frame;
+}
+
+/* Burst-MTI residual of one bin over every loop of a frame, summed over the
+ * vertical TX pair (TX0 and TX2 of three) and all RX (l3_channels.c).
+ * perLoop[] (gCapturePlan.loops values) receives each loop's residual
+ * power; obs the residual energy and the lag-1 loop autocorrelation the
+ * trigger reads Doppler from. Either may be NULL. */
+static void l3_verticalResidual(const l3_detect_frame_t *source, uint32_t localBin,
+                                float *perLoop, l3_trig_obs_t *obs)
+{
+    l3_channel_frame_t frame = l3_channelFrame(source);
+
+    l3_channels_residual(&frame, localBin, perLoop, obs);
+}
+
+/* The DSS side of l3_scoreSpans, with the detect link further down. */
+static void l3_dspScoreSpans(const l3_detect_frame_t *frame, const l3_span_t *local, uint32_t n,
+                             l3_trig_obs_t *obs, uint32_t *scored, uint32_t route);
+static int32_t l3_dspLinkTryLock(void);
+static void l3_dspLinkUnlock(void);
+
+/* The detector's observation array and the DSS's result block are the same
+ * size: every local bin one can hold, the other can. */
+typedef char l3_dsp_bins_match_trigger[(L3_DSP_MAX_BINS == L3_TRIG_MAX_BINS) ? 1 : -1];
+
+/* The MSS's own scorer for l3_dsp_spans_score: whatever the frame's format. */
+static int32_t l3_mssScorer(void *ctx, uint32_t localBin, l3_bin_obs_t *out)
+{
+    l3_verticalResidual((const l3_detect_frame_t *)ctx, localBin, NULL, out);
+    return 0;
+}
+
+static void l3_mssScoreSpans(const l3_detect_frame_t *frame, const l3_span_t *local,
+                             uint32_t n, l3_trig_obs_t *obs, uint32_t *scored)
+{
+    (void)l3_dsp_spans_score(local, n, frame->binCount, l3_mssScorer, (void *)frame, obs,
+                             scored);
+}
+
+/* A frame the DSS can score: IQ16 in the L3 ring (the compact formats' detect
+ * frames are in MSS scratch; IQ8 is not what the shared scorer reads). */
+static uint8_t l3_dspFrameEligible(const l3_detect_frame_t *frame)
+{
+    uintptr_t base = (uintptr_t)frame->base;
+    uint32_t ntx = (gCapturePlan.loops == 0U) ? 0U
+                                              : gCapturePlan.chirpsPerFrame / gCapturePlan.loops;
+
+    return (uint8_t)(frame->scratch == L3_SCRATCH_NONE && frame->cb == 2U &&
+                     gCapturePlan.loops > 0U && gCapturePlan.loops <= L3_IQ16_MAX_LOOPS &&
+                     ntx > 0U && ntx <= L3_BIN_SCORE_MAX_TX &&
+                     base >= SOC_XWR68XX_MSS_L3RAM_BASE_ADDRESS &&
+                     base < SOC_XWR68XX_MSS_L3RAM_BASE_ADDRESS + L3_TOTAL_BYTES);
+}
+
+static void l3_detectCoreEnsure(void)
+{
+    if (!gDetectCoreReady) {
+        l3_detect_core_init(&gDetectCore);
+        gDetectCoreReady = 1U;
+    }
+}
+
+/* The scan plan's spans (GLOBAL bins) of a frame, each bin scored once into
+ * obs[local] on the core l3_detect_core routes the frame to: the MSS, the
+ * DSS, or both at once to compare (verify). Every scan-plan read goes
+ * through here in one call per frame, so the two cores are always asked
+ * for exactly the same bins and the DSS costs one round trip a frame. */
+static void l3_scoreSpans(const l3_detect_frame_t *frame, const l3_span_t *spans, uint32_t n,
+                          l3_trig_obs_t *obs)
+{
+    l3_span_t local[L3_DSP_MAX_SPANS];
+    uint32_t scored[L3_DSP_BITMAP_WORDS] = { 0U, 0U };
+    uint32_t nLocal = l3_dsp_spans_localize(frame->binStart, frame->binCount, spans, n, local);
+    uint8_t eligible = 0U;
+    uint32_t route;
+
+    if (nLocal == 0U) {
+        return;
+    }
+    l3_detectCoreEnsure();
+    gDetectEvent.scoreStart = Cycleprofiler_getTimeStamp();
+    /* The link is shared with the CLI's dsp commands: a frame that finds it
+     * busy goes to the MSS as ineligible, not as a DSS failure. */
+    if (gDetectCore.active != L3_DETECT_CORE_MSS && l3_dspFrameEligible(frame) &&
+        l3_dspLinkTryLock() == 0) {
+        eligible = 1U;
+    }
+    route = l3_detect_core_route(&gDetectCore, eligible);
+    gDetectEvent.core = (uint8_t)route;
+    if (route == L3_DETECT_CORE_MSS) {
+        if (eligible) {
+            l3_dspLinkUnlock();
+        }
+        l3_mssScoreSpans(frame, local, nLocal, obs, scored);
+    } else {
+        l3_dspScoreSpans(frame, local, nLocal, obs, scored, route);
+        l3_dspLinkUnlock();
+    }
+    gDetectEvent.scoreEnd = Cycleprofiler_getTimeStamp();
+    gDetectEvent.flags |= (uint8_t)L3_TIMING_FLAG_SCORED;
+}
+
+/* l3sparse's per-loop residual power rows. */
+/* Per-loop residual power of a FROZEN ring slot, for the l3sparse power map
+ * and the l3track cell selection: always the retained window in the ring,
+ * never the scratch, which the HWA has long since reused. */
+static void l3_verticalPowerLoops(uint32_t slot, uint32_t localBin, float *out)
+{
+    l3_detect_frame_t frame = l3_ringFrameOf(slot);
+
+    l3_verticalResidual(&frame, localBin, out, NULL);
+}
+
+/* Static (non-MTI) power of one bin (l3_channels.c): the view of a
+ * stationary ball on the tee that the trigger's residual removes. */
+static float l3_verticalStaticPower(const l3_detect_frame_t *source, uint32_t localBin,
+                                    uint32_t loopStep)
+{
+    l3_channel_frame_t frame = l3_channelFrame(source);
+
+    return l3_channels_static_power(&frame, localBin, loopStep);
+}
+
+/* One target's antenna channels at localBin for angle estimation, its
+ * per-loop Doppler phase unwound (l3_channels.c). */
+static void l3_channelSnapshot(const l3_detect_frame_t *source, uint32_t localBin, float lag1PhaseRad,
+                               float radialVelocityMps, l3_angle_snapshot_t *out)
+{
+    l3_channel_frame_t frame = l3_channelFrame(source);
+
+    l3_channels_snapshot(&frame, localBin, lag1PhaseRad, radialVelocityMps, out);
+}
+
+/* The same channels for a STATIC target (the ball on its tee), raw
+ * (l3_channels.c). */
+static void l3_channelSnapshotStatic(const l3_detect_frame_t *source, uint32_t localBin, l3_angle_snapshot_t *out)
+{
+    l3_channel_frame_t frame = l3_channelFrame(source);
+
+    l3_channels_snapshot_static(&frame, localBin, out);
+}
+
+/* --- CLI notices from the detect task ----------------------------------------
+ * The detect task runs below the CLI task, so it must not write the CLI UART
+ * itself: a host command arriving mid-line preempts it and the CLI task's
+ * reply lands inside the notice (the host then sees half a debug line, or
+ * misses "Triggered" altogether). Lines are queued here and written by
+ * l3_noticeTask at the CLI task's priority, where each line goes out whole.
+ * A full queue drops the line and counts it; "Triggered" is queued ahead of
+ * the debug line that describes it. */
+#define L3_NOTICE_LINES      4U
+#define L3_NOTICE_LINE_BYTES 160U
+static char gNoticeLines[L3_NOTICE_LINES][L3_NOTICE_LINE_BYTES];
+static volatile uint32_t gNoticeHead;     /* next line the notice task writes */
+static volatile uint32_t gNoticeTail;     /* next slot to fill */
+static volatile uint32_t gNoticeDropped;
+static Semaphore_Handle  gNoticeSemaphore;
+
+static void l3_queueNotice(const char *text)
+{
+    uintptr_t key = Hwi_disable();
+    uint32_t next = (gNoticeTail + 1U) % L3_NOTICE_LINES;
+
+    if (gNoticeSemaphore == NULL || next == gNoticeHead) {
+        gNoticeDropped++;
+        Hwi_restore(key);
+        return;
+    }
+    strncpy(gNoticeLines[gNoticeTail], text, L3_NOTICE_LINE_BYTES - 1U);
+    gNoticeLines[gNoticeTail][L3_NOTICE_LINE_BYTES - 1U] = '\0';
+    gNoticeTail = next;
+    Hwi_restore(key);
+    Semaphore_post(gNoticeSemaphore);
+}
+
+static void l3_noticeTask(UArg arg0, UArg arg1)
+{
+    (void)arg0;
+    (void)arg1;
+    while (1) {
+        Semaphore_pend(gNoticeSemaphore, BIOS_WAIT_FOREVER);
+        while (gNoticeHead != gNoticeTail) {
+            CLI_write("%s", gNoticeLines[gNoticeHead]);
+            gNoticeHead = (gNoticeHead + 1U) % L3_NOTICE_LINES;
+        }
+    }
+}
+
+/* Stats and debugCfg still speak the phase names the host already parses.
+ * The detector itself is l3_trigger.c; these names are only a readout. */
+static const char *l3_triggerPhaseName(uint8_t phase)
+{
+    static const char *const names[] = {
+        "off", "no-frame", "bin-outside", "tee-low", "occupying",
+        "watching", "no-approach", "toward", "away", "fired", "no-ball"
+    };
+
+    if (phase >= (uint8_t)(sizeof(names) / sizeof(names[0]))) {
+        return "unknown";
+    }
+    return names[phase];
+}
+
+/* The debug line for a phase, or 0 when debug is off or the phase is
+ * unchanged. The CLI task writes it directly (debugCfg 1 answers with the
+ * current line before Done); the detect task queues it. */
+static int32_t l3_formatTriggerDebug(uint8_t phase, char *out, uint32_t cap)
+{
+    if (!gTriggerDebug) {
+        return 0;
+    }
+    if (phase == gTriggerDebugPhase) {
+        return 0;
+    }
+    gTriggerDebugPhase = phase;
+    (void)snprintf(
+        out, cap,
+        "trig phase=%s tee=%u approach=%u ready=%u toward=%u away=%u "
+        "run=%u peak=%u have=%u bin=%u level=%u latched=%u\n",
+        l3_triggerPhaseName(phase),
+        (unsigned)gTriggerTeePower,
+        0U,
+        0U,
+        0U,
+        0U,
+        0U,
+        0U,
+        0U,
+        (unsigned)gTrigCfg.teeBin,
+        (unsigned)gTrigCfg.snr,
+        (unsigned)gSelfTriggerLatched);
+    return 1;
+}
+
+/* Detect task: record the phase and queue its debug line for the notice
+ * task. Static line buffer: the detect task's stack is small and only it
+ * runs this. */
+static void l3_noteTrigger(uint8_t phase, float tee)
+{
+    static char line[L3_NOTICE_LINE_BYTES];
+
+    gTriggerPhase = phase;
+    gTriggerTeePower = (uint32_t)tee;
+    if (l3_formatTriggerDebug(phase, line, sizeof(line))) {
+        l3_queueNotice(line);
+    }
+}
+
+/* The ring was re-armed for the next shot: forget the track and any fired
+ * state, keep the noise floor, counters and log. */
+/* Between shots: if the ball detector holds a lock and adaptive windows are
+ * enabled, move the plan's windows to the ball and rebuild the frame tables.
+ * Runs on the CLI task with the capture stopped, before the HWA restarts. */
+static void l3_applyAdaptiveWindows(void)
+{
+    uint32_t ballBin;
+    l3_adaptive_windows_t windows;
+
+    if (!gAdaptiveCfg.enabled || gCaptureActive || !l3_ball_locked(&gBall, &ballBin)) {
+        return;
+    }
+    if (!l3_adaptive_windows(&gAdaptiveCfg, ballBin, N_SAMPLES, gCapturePlan.preBins,
+                             gCapturePlan.impactBins, gCapturePlan.postBins, &windows)) {
+        return;
+    }
+    gAdaptiveWindows = windows;
+    if (!l3_adaptive_differs(&windows, gCapturePlan.preStart, gCapturePlan.impactStart,
+                             gCapturePlan.postStart, gCapturePlan.lateStart)) {
+        return;
+    }
+    gCapturePlan.preStart = windows.preStart;
+    gCapturePlan.impactStart = windows.impactStart;
+    gCapturePlan.postStart = windows.postStart;
+    gCapturePlan.lateStart = windows.lateStart;
+    if (l3_finalizeCapturePlan(gCapturePlan.loops) == 0) {
+        gAdaptiveApplied++;
+    }
+}
+
+static void l3_trigRearm(void)
+{
+    l3_applyAdaptiveWindows();
+    l3_track_reset(&gClubTrack);
+    l3_impact_rearm(&gRangeImpact);
+    l3_leave_rearm(&gLeave);
+    l3_impact_fit_reset(&gImpactFit);
+    l3_shot_rearm(&gShot);
+    l3_ball_track_reset(&gBallTrack);
+    memset(&gLaunch, 0, sizeof(gLaunch));
+    gPostTimestampUs = 0U;
+    gPostFramesScored = 0U;
+    gBallFloor = 0.0F;
+    gLeaveFloor = 0.0F;
+    gShotResultReady = 0U;
+    gBandFrozen = 0U;
+}
+
+/* Stage timing: Cycleprofiler ticks at the CPU clock; one call per stage. */
+static void l3_profileStage(uint32_t stage, uint32_t startTicks)
+{
+    if (!gProfileReady) {
+        l3_profile_init(&gProfile, gCpuClock / 1000000U);
+        gProfileReady = 1U;
+    }
+    l3_profile_add(&gProfile, stage, Cycleprofiler_getTimeStamp() - startTicks);
+}
+
+/* The calibration starts as identity; the CLI refines it. */
+static void l3_ensureRadarCal(void)
+{
+    if (gRadarCal.virtualElements == 0U) {
+        l3_cal_identity(&gRadarCal, L3_CAL_MAX_VIRTUAL);
+    }
+    if (!gImpactCfgSet) {
+        l3_impact_cfg_defaults(&gImpactCfg);
+        gImpactCfgSet = 1U;
+    }
+    if (!gImpactFitCfgSet) {
+        l3_impact_fit_cfg_defaults(&gImpactFitCfg);
+        l3_band_noise_reset(&gBandNoise);
+        gImpactFitCfgSet = 1U;
+    }
+}
+
+/* The club track's configuration follows the trigger's arm: statistic and
+ * snr for target extraction, the range resolution trackCfg supplied (else the
+ * 6 m / 128 default) for metres and m/s. */
+static void l3_clubTrackConfigure(void)
+{
+    l3_track_cfg_t cfg;
+
+    l3_track_cfg_defaults(&cfg);
+    if (gTrackRangeResM > 0.0) {
+        cfg.binWidthM = (float)gTrackRangeResM;
+    }
+    if (gTrigLoopPeriodS > 0.0F) {
+        cfg.velocitySpanMps = 2.0F * L3_OBS_WAVELENGTH_M / (4.0F * gTrigLoopPeriodS);
+    }
+    l3_ensureRadarCal();
+    cfg.cal = gRadarCal;
+    l3_track_init(&gClubTrack, &cfg);
+    /* The fit's geometry follows the club track's; its band is left as set. */
+    gImpactFitCfg.binWidthM = cfg.binWidthM;
+    l3_impact_init(&gRangeImpact, &gImpactCfg);
+    {
+        l3_leave_cfg_t leaveCfg;
+
+        l3_leave_cfg_defaults(&leaveCfg);
+        leaveCfg.binWidthM = cfg.binWidthM;
+        l3_leave_init(&gLeave, &leaveCfg);
+    }
+    l3_scan_cfg_defaults(&gScanCfg);
+    l3_impact_fit_reset(&gImpactFit);
+    /* The ball track shares the club track's geometry; the shot machine
+     * gives the ball tracker the whole post movie. */
+    l3_ball_track_cfg_defaults(&gBallTrackCfg);
+    gBallTrackCfg.core.binWidthM = cfg.binWidthM;
+    gBallTrackCfg.core.velocitySpanMps = cfg.velocitySpanMps;
+    gBallTrackCfg.core.cal = gRadarCal;
+    l3_ball_track_init(&gBallTrack, &gBallTrackCfg);
+    l3_shot_cfg_defaults(&gShotCfg);
+    gShotCfg.requireBall = gBallCfg.follow;
+    if (gCapturePlan.postFrames > 0U) {
+        gShotCfg.ballTrackFrames = gCapturePlan.postFrames;
+    }
+    l3_shot_init(&gShot, &gShotCfg);
+    memset(&gLaunch, 0, sizeof(gLaunch));
+}
+
+/* The ball tracker acquires 1..originGateBins beyond its origin; with the
+ * tee band dropping every target inside it, the origin is the band's far
+ * edge, else the ball's bin. */
+static float l3_ballArmBin(uint32_t teeBin)
+{
+    return gBand.valid ? gBand.hiBin : (float)teeBin;
+}
+
+/* The shot machine's view of one pre-impact frame. Entering IMPACT arms the
+ * ball tracker at the destination (the band's far edge with a band) with the
+ * impact time: the range-only impact's crossing when it fired, else this
+ * frame's. */
+static void l3_shotObserve(uint32_t teeBin, int32_t fired, uint32_t impactUs)
+{
+    l3_shot_input_t in;
+    l3_ball_anchor_t anchor;
+    uint32_t frameUs = gPreFramesCaptured * (uint32_t)gFramePeriodUs;
+
+    memset(&in, 0, sizeof(in));
+    in.ballLocked = gTrigDestBall;
+    in.ballPosition = gBallPosition;
+    in.clubActive = gClubTrack.active;
+    in.clubPoints = gClubTrack.count;
+    in.rangeFired = (uint8_t)(fired ? 1U : 0U);
+    in.impactTimestampUs = fired ? impactUs : frameUs;
+    in.delivery = &gDelivery;
+    in.club = &gClubTrack;
+    if (l3_shot_update(&gShot, &in, gPreFramesCaptured) == L3_SHOT_IMPACT &&
+        gShot.impactFrame == gPreFramesCaptured) {
+        l3_ball_track_anchor(&gBallTrack, (float)teeBin, l3_ballArmBin(teeBin),
+                             in.impactTimestampUs, &gImpactFitCfg, &gClubTrack, &anchor);
+        l3_ball_track_arm(&gBallTrack, &anchor, &gBallPosition);
+        if (gBand.valid) {
+            /* The post window's floor, frozen (l3_scan.h): the fallback's
+             * median beyond the band, else the trigger's own floor. */
+            gBallFloor = (gLeaveFloor > 0.0F) ? gLeaveFloor : gTrig.floor;
+        }
+        gPostTimestampUs = frameUs;
+    }
+}
+
+/* Every other completed pre-trigger slot: the static power of the whole
+ * window, loops subsampled by four, into the ball detector. About a fifth
+ * of the trigger's own cost per frame. */
+static void l3_considerBall(uint32_t slot)
+{
+    l3_detect_frame_t frame = l3_detectFrameOf(slot);
+    static float power[L3_BALL_MAX_BINS];
+    uint32_t count = frame.binCount;
+    uint32_t bin;
+    uint32_t ticks;
+
+    if (gBall.state == L3_BALL_STATE_OFF || gCapturePlan.loops == 0U ||
+        gBallCfg.framesPerUpdate == 0U ||
+        (gPreFramesCaptured % gBallCfg.framesPerUpdate) != 0U) {
+        return;
+    }
+    if (count > L3_BALL_MAX_BINS) {
+        count = L3_BALL_MAX_BINS;
+    }
+    gBallBusy = 1U;
+    ticks = Cycleprofiler_getTimeStamp();
+    for (bin = 0U; bin < count; bin++) {
+        power[bin] = l3_verticalStaticPower(&frame, bin, 4U);
+    }
+    if (l3_detectFrameStale(&frame)) {
+        gBallBusy = 0U;
+        return;
+    }
+    (void)l3_ball_update(&gBall, frame.binStart, power, count);
+    {
+        /* The locked ball's direction from its static return: when due (a
+         * new or moved lock, or the refresh), else the last one stands. */
+        uint32_t ballBin;
+
+        if (l3_ball_angle_due(&gBall, &gBallAngleClock, L3_BALL_ANGLE_REFRESH_UPDATES)) {
+            if (l3_ball_locked(&gBall, &ballBin) && ballBin >= frame.binStart &&
+                ballBin - frame.binStart < count) {
+                static l3_angle_snapshot_t snapshot;
+
+                l3_channelSnapshotStatic(&frame, ballBin - frame.binStart, &snapshot);
+                gBallAngleValid =
+                    (uint8_t)(l3_angle_estimate(&gRadarCal, &snapshot, &gBallAngle) &&
+                              gBallAngle.elevationValid &&
+                              gBallAngle.elevationPeakRatio >= L3_BALL_ANGLE_MIN_PEAK_RATIO);
+            } else {
+                /* Locked outside this frame's window: try again next update. */
+                gBallAngleValid = 0U;
+                gBallAngleClock.valid = 0U;
+            }
+        } else if (!l3_ball_locked(&gBall, &ballBin)) {
+            gBallAngleValid = 0U;
+        }
+    }
+    l3_profileStage(L3_PROF_BALL_DETECT, ticks);
+    gBallBusy = 0U;
+}
+
+/* SOLVE: impact from the tracks either side of the band (club in as the shot
+ * froze it, club out after the impact frame, ball out); a verdict other than
+ * none replaces the frozen impact time. firmware_replay runs the same call
+ * when the shot first reaches RESULT, as here. */
+static void l3_impactFitRun(void)
+{
+    l3_fit_list_t clubIn = { gShot.clubTrajectory, gShot.clubPoints };
+    l3_fit_span_t clubOut;
+    l3_fit_span_t ballOut = { &gBallTrack.core, 0U, gBallTrack.core.count };
+
+    l3_fit_span_after(&gClubTrack, gShot.impactFrame, &clubOut);
+    l3_impact_fit_run(&gImpactFitCfg, &clubIn, &clubOut, &ballOut,
+                      (float)gClubTrackDest * gClubTrack.cfg.binWidthM,
+                      (uint8_t)(gTrigDestBall ? 0U : 1U), gShot.impactTimestampUs, &gImpactFit);
+    if (gImpactFit.verdict != L3_FIT_VERDICT_NONE && gImpactFit.impactUs > 0.0F) {
+        gShot.impactTimestampUs = l3_round_us(gImpactFit.impactUs);
+    }
+}
+
+/* Per kept post-impact slot: the whole window as observations, ranked
+ * targets against the trigger's floor, into the ball tracker (which only
+ * looks at or beyond the origin), angles for the appended point, the launch
+ * fit, and the shot machine's post-impact transitions. Runs on the detect
+ * task after the freeze was requested, while the post movie is filling. */
+static void l3_considerBallTrack(uint32_t slot)
+{
+    l3_detect_frame_t frame = l3_detectFrameOf(slot);
+    static l3_trig_obs_t obs[L3_TRIG_MAX_BINS];
+    static l3_target_obs_t targets[L3_OBS_MAX_TARGETS];
+    static l3_angle_snapshot_t snapshot;
+    l3_obs_params_t params;
+    l3_shot_input_t in;
+    l3_track_point_t newest;
+    uint32_t count = frame.binCount;
+    uint32_t found;
+    uint32_t frameIndex;
+    uint32_t ticks;
+    int32_t ballAppended;
+
+    if (!gBallTrack.armed || gCapturePlan.loops == 0U) {
+        return;
+    }
+    if (count > L3_TRIG_MAX_BINS) {
+        count = L3_TRIG_MAX_BINS;
+    }
+    gPostTimestampUs += gFrameDeltaUs[slot];
+    gPostFramesScored++;
+    frameIndex = gPreFramesCaptured + gPostFramesScored;
+    gTrigBusy = 1U;
+    ticks = Cycleprofiler_getTimeStamp();
+    params.stat = gTrigCfg.stat;
+    /* A departing ball is a weaker return than a club: its own snr, and with
+     * recovery on the history's lower one (l3_ball_track_extract_snr). */
+    params.snr = (gBallSnr > 0.0F) ? gBallSnr : gBallTrackCfg.snr;
+    params.snr = l3_ball_track_extract_snr(&gBallTrack.cfg, params.snr);
+    params.loopPeriodS = gTrigLoopPeriodS;
+    params.subBin = gObsSubBin;
+    if (gImpactFitCfg.bandBins > 0.0F && gBand.valid) {
+        /* The scan plan's post windows (l3_scan.h): postBins following the
+         * ball and postClubBins following the club, merged so no bin is
+         * extracted twice, against the floor frozen at impact (a 16-bin
+         * window's own median is the ball, the club and the ridge). */
+        const l3_club_track_t *ball = &gBallTrack.core;
+        float ballPredicted = ball->lastBin +
+                              ball->velocityBinsPerFrame * (float)(frameIndex - ball->lastFrame);
+        uint8_t clubLive = (gClubTrack.active && gClubTrack.count > 0U) ? 1U : 0U;
+        float clubPredicted =
+            clubLive ? gClubTrack.lastBin +
+                           gClubTrack.velocityBinsPerFrame *
+                               (float)(frameIndex - gClubTrack.lastFrame)
+                     : 0.0F;
+        l3_span_t ballSpan;
+        l3_span_t clubSpan;
+        l3_span_t merged[2];
+        uint32_t spans;
+        uint32_t k;
+
+        l3_scan_post(&gScanCfg, frame.binStart, count, &gBand, ball->active, ballPredicted,
+                     clubLive, clubPredicted, &ballSpan, &clubSpan);
+        spans = l3_scan_merge(ballSpan, clubSpan, merged);
+        l3_scoreSpans(&frame, merged, spans, obs);
+        if (l3_detectFrameStale(&frame)) {
+            gTrigBusy = 0U;
+            return;
+        }
+        found = 0U;
+        for (k = 0U; k < spans; k++) {
+            found += l3_obs_extract(&params, frameIndex, gPostTimestampUs, merged[k].first,
+                                    &obs[merged[k].first - frame.binStart], merged[k].count,
+                                    gBallFloor, &targets[found], L3_OBS_MAX_TARGETS - found);
+        }
+    } else {
+        l3_span_t whole;
+
+        whole.first = frame.binStart;
+        whole.count = count;
+        l3_scoreSpans(&frame, &whole, 1U, obs);
+        if (l3_detectFrameStale(&frame)) {
+            gTrigBusy = 0U;
+            return;
+        }
+        l3_obs_floor_update(&gBallFloor, gTrigCfg.stat, obs, count, L3_TRIG_FLOOR_SHIFT);
+        found = l3_obs_extract(&params, frameIndex, gPostTimestampUs, frame.binStart, obs, count,
+                               gBallFloor, targets, L3_OBS_MAX_TARGETS);
+    }
+    /* The tee band's ridge is neither club nor ball; without a band nothing
+     * is dropped. gBand is the last pre-impact frame's. */
+    found = l3_band_filter(&gBand, targets, found);
+    /* After impact two tracks are visible: the club carries on (followed by
+     * association only, the stronger return) beside the departing ball.
+     * gDelivery was read at impact and stays the approach's. The ball no
+     * longer receives the club's claim (on the 2026-09-27 captures that lost
+     * more balls than it saved); the club receives the ball's instead. */
+    /* The ball first: its claim and its rate tell the club what it is not. */
+    ballAppended =
+        l3_ball_track_update_joint(&gBallTrack, targets, found, frameIndex, gPostTimestampUs,
+                                   L3_TRACK_NO_TARGET);
+    {
+        l3_follow_ctx_t follow;
+        float ballRate = l3_track_recent_rate(&gBallTrack.core);
+
+        follow.bandValid = gBand.valid;
+        follow.bandHiBin = gBand.hiBin;
+        follow.originBin = (float)gClubTrackDest;
+        follow.impactTimestampUs = gShot.impactTimestampUs;
+        /* No approach measured: the fastest club bounds re-acquisition. */
+        follow.approachBinsPerS = (gShot.delivery.speedValid
+                                       ? gShot.delivery.radialSpeedMps
+                                       : L3_TRACK_FOLLOW_UNKNOWN_APPROACH_MPS) /
+                                  gClubTrack.cfg.binWidthM;
+        follow.approachKnown = gShot.delivery.speedValid ? 1U : 0U;
+        follow.ballBinsPerS = (ballRate > 0.0F) ? ballRate : 0.0F;
+        follow.ballClaimIndex = ballAppended ? gBallTrack.lastTargetIndex : L3_TRACK_NO_TARGET;
+        follow.frameUs = gFramePeriodUs;
+        (void)l3_track_follow(&gClubTrack, targets, found, frameIndex, gPostTimestampUs, &follow);
+        /* The club's claim reaches the ball's history now: never recovered. */
+        l3_ball_track_note_club(&gBallTrack, frameIndex, gClubTrack.lastTargetIndex);
+    }
+    if (ballAppended && gBallTrack.lastTargetIndex < found && gBallTrack.core.count > 1U &&
+        l3_track_point(&gBallTrack.core, gBallTrack.core.count - 1U, &newest)) {
+        const l3_target_obs_t *hit = &targets[gBallTrack.lastTargetIndex];
+
+        {
+            l3_angle_obs_t angle;
+            /* The fitted range rate, not the two-point difference, picks the
+             * TDM branch; the measured lag-1 phase stays the loop rotor. */
+            float rateMps = l3_track_recent_rate(&gBallTrack.core) * gBallTrack.core.cfg.binWidthM;
+
+            l3_channelSnapshot(&frame, (uint32_t)hit->peakBin - frame.binStart,
+                               hit->dopplerPhaseRad,
+                               (rateMps != 0.0F) ? rateMps : newest.radialVelocityMps, &snapshot);
+            if (l3_angle_estimate(&gRadarCal, &snapshot, &angle)) {
+                uint8_t flags = 0U;
+
+                if (angle.azimuthValid) {
+                    flags |= L3_OBS_ANGLE_AZIMUTH;
+                }
+                if (angle.elevationValid) {
+                    flags |= L3_OBS_ANGLE_ELEVATION;
+                }
+                (void)l3_ball_track_set_angles(&gBallTrack, angle.azimuthRad,
+                                               angle.elevationRad, flags, angle.confidence);
+                gAngleEstimates++;
+            }
+        }
+    }
+#if L3_BALL_HYPOTHESES
+    {
+        /* Angles for every ball-hypothesis point this frame appended: once one
+         * is chosen, its early points must still carry them. */
+        uint32_t index;
+
+        for (index = 0U; index < L3_BALL_HYP_MAX; index++) {
+            const l3_ball_hyp_t *hyp = &gBallTrack.hyps.hyp[index];
+            const l3_target_obs_t *hit;
+            l3_angle_obs_t angle;
+            float rate;
+            float at;
+            float residual;
+            float radial = 0.0F;
+
+            if (!hyp->active || hyp->lastTargetIndex >= found) {
+                continue;
+            }
+            hit = &targets[hyp->lastTargetIndex];
+            if (l3_ball_hyp_fit(hyp, hyp->points[hyp->count - 1U].timestampUs, &rate, &at,
+                                &residual)) {
+                radial = rate * gBallTrack.hyps.cfg.binWidthM;
+            }
+            l3_channelSnapshot(&frame, (uint32_t)hit->peakBin - frame.binStart,
+                               hit->dopplerPhaseRad, radial, &snapshot);
+            if (l3_angle_estimate(&gRadarCal, &snapshot, &angle)) {
+                uint8_t flags = 0U;
+
+                if (angle.azimuthValid) {
+                    flags |= L3_OBS_ANGLE_AZIMUTH;
+                }
+                if (angle.elevationValid) {
+                    flags |= L3_OBS_ANGLE_ELEVATION;
+                }
+                (void)l3_ball_hyps_set_angles(&gBallTrack.hyps, index, angle.azimuthRad,
+                                              angle.elevationRad, flags, angle.confidence);
+                gAngleEstimates++;
+            }
+        }
+    }
+#endif /* L3_BALL_HYPOTHESES */
+    /* Not once the result is built: launch rebuilds gLaunch, wiping the angles
+     * RESULT reconstructed. */
+    if (!gShotResultReady) {
+        (void)l3_ball_track_launch(&gBallTrack, &gLaunch);
+    }
+    l3_profileStage(L3_PROF_BALL_TRACK, ticks);
+    gTrigBusy = 0U;
+    /* IMPACT -> BALL_TRACK -> SOLVE on the frames; SOLVE -> RESULT at once,
+     * the launch fit being the solver. */
+    memset(&in, 0, sizeof(in));
+    in.ballLocked = gTrigDestBall;
+    in.ballPosition = gBallPosition;
+    in.postFrame = 1U;
+    in.ballTrackDone = gBallTrack.done;
+    in.delivery = &gDelivery;
+    in.club = &gClubTrack;
+    if (l3_shot_update(&gShot, &in, frameIndex) == L3_SHOT_SOLVE) {
+        in.solved = 1U;
+        (void)l3_shot_update(&gShot, &in, frameIndex);
+    }
+    if (gShot.state == L3_SHOT_RESULT && !gShotResultReady) {
+        uint32_t reconstructTicks = Cycleprofiler_getTimeStamp();
+
+        /* Once per shot: the ball's direction from the tee (l3_ball_fit.h). */
+        (void)l3_ball_track_reconstruct(&gBallTrack, &gLaunch);
+        l3_profileStage(L3_PROF_RECONSTRUCT, reconstructTicks);
+        l3_impactFitRun();
+        l3_result_build(&gShot, &gBallTrack, &gLaunch, &gImpactFit, ++gShotId, gTrigDestBall,
+                        &gShotResult);
+        gShotResultReady = 1U;
+    }
+}
+
+/* The club track's targets on a pre-impact frame; returns how many
+ * (firmware_replay._scan_pre_impact). obs holds the frame's scored bins at
+ * their local index (windowFirst is the frame's first global bin): the scan
+ * plan's spans (l3_scan.h), scored by l3_considerSelfTrigger. The club's
+ * targets come from its span against the trigger's floor, and with a band only
+ * those short of it are kept: the club approaches the ball, so nothing in the
+ * band or beyond it is the club before impact. With a band the ball-leave
+ * fallback first reads its span beyond it, into the same target buffer (no RAM
+ * of its own), and leaves the median there as the post window's floor. */
+static uint32_t l3_preImpactClubTargets(const l3_trig_obs_t *obs, uint32_t windowFirst,
+                                        const l3_span_t *club, const l3_span_t *leave,
+                                        const l3_obs_params_t *params, float floor,
+                                        uint32_t frameIndex, uint32_t frameUs,
+                                        l3_target_obs_t *targets, int32_t *left)
+{
+    uint32_t found;
+
+    if (gBand.valid && leave->count > 0U) {
+        uint32_t leaving = l3_leave_targets(&gLeave.cfg, params, &obs[leave->first - windowFirst],
+                                            leave->first, leave->count, frameIndex, frameUs,
+                                            gBand.hiBin, targets, L3_OBS_MAX_TARGETS,
+                                            &gLeaveFloor);
+        l3_track_point_t newest;
+        /* The club track as it stood after the last frame, near the band. */
+        uint8_t near = (gClubTrack.count > 0U &&
+                        l3_track_point(&gClubTrack, gClubTrack.count - 1U, &newest))
+                           ? l3_leave_club_near(&gLeave.cfg, gClubTrack.active,
+                                                gClubTrack.count, newest.rangeBin,
+                                                gBand.loBin)
+                           : 0U;
+
+        *left = l3_leave_update(&gLeave, targets, leaving, gBand.hiBin,
+                                0.5F * (gBand.loBin + gBand.hiBin), near);
+    }
+    if (club->count == 0U) {
+        return 0U;
+    }
+    found = l3_obs_extract(params, frameIndex, frameUs, club->first,
+                           &obs[club->first - windowFirst], club->count, floor, targets,
+                           L3_OBS_MAX_TARGETS);
+    if (gBand.valid) {
+        found = l3_band_keep_short(&gBand, targets, found);
+    }
+    /* The scene at address (the golfer's body, still scatterers) is not the
+     * club: the band's noise map learned it on frames with no club track. */
+    return l3_band_clutter_filter(&gBandNoise, gImpactFitCfg.clutterSigmas, targets, found);
+}
+
+/* Per completed pre-trigger slot: reduce the watch region to one observation
+ * per bin and hand it to the detector. The detect task passes the slot it
+ * popped, so a slow read does not score a frame the ring has reused. */
+/* --- the club's pending angles (l3_angle_queue.h) ---------------------------
+ * Pushed by the detect task, drained by the angle task below it; a fire
+ * frame drains on the detect task. Task_disable serialises the queue: the
+ * angle task holds it only to peek and to finish, never over an estimate. */
+static void l3_angleQueuePush(uint32_t timestampUs, const l3_angle_snapshot_t *snapshot)
+{
+    UInt key = Task_disable();
+
+    (void)l3_angle_queue_push(&gAngleQueue, timestampUs, snapshot);
+    Task_restore(key);
+    if (gAngleSemaphore != NULL) {
+        Semaphore_post(gAngleSemaphore);
+    }
+}
+
+/* On the detect task, at a fire: every pending angle now. The angle task
+ * cannot hold the queue meanwhile (it is below this task and holds it only
+ * with scheduling off); a job it was estimating is superseded. */
+static void l3_angleQueueDrain(void)
+{
+    static l3_angle_job_t job;
+    l3_angle_obs_t obs;
+
+    while (l3_angle_queue_pop(&gAngleQueue, &job)) {
+        if (l3_angle_queue_apply(&gAngleQueue, &gRadarCal, &job, &gClubTrack, &obs) == 1) {
+            gLastAngle = obs;
+            gAngleEstimates++;
+        }
+    }
+}
+
+static void l3_angleTask(UArg arg0, UArg arg1)
+{
+    static l3_angle_job_t job;
+
+    (void)arg0;
+    (void)arg1;
+    while (1) {
+        Semaphore_pend(gAngleSemaphore, BIOS_WAIT_FOREVER);
+        while (1) {
+            l3_angle_obs_t obs;
+            int32_t estimated;
+            int32_t have;
+            UInt key;
+
+            key = Task_disable();
+            have = l3_angle_queue_peek(&gAngleQueue, &job);
+            Task_restore(key);
+            if (!have) {
+                break;
+            }
+            estimated = l3_angle_estimate(&gRadarCal, &job.snapshot, &obs);
+            key = Task_disable();
+            if (l3_angle_queue_finish(&gAngleQueue, &job, estimated, &obs, &gClubTrack) == 1) {
+                gLastAngle = obs;
+                gAngleEstimates++;
+            }
+            Task_restore(key);
+        }
+    }
+}
+
+static void l3_considerSelfTrigger(uint32_t slot)
+{
+    l3_detect_frame_t frame = l3_detectFrameOf(slot);
+    /* Static: this runs on the detect task, whose stack is small. */
+    static l3_trig_obs_t obs[L3_TRIG_MAX_BINS];
+    uint32_t first;
+    uint32_t count;
+    uint32_t windowCount;
+    l3_span_t plan[4];
+    l3_span_t region;
+    l3_span_t club;
+    l3_span_t leave;
+    l3_span_t chunk;
+    int32_t ranged = 0;
+    int32_t left = 0;
+    int32_t fired;
+    uint32_t impactUs;
+    l3_track_point_t newest;
+    uint32_t ticks;
+    uintptr_t key;
+
+    uint32_t teeBin = gTrigCfg.teeBin;
+
+    if (!gTriggerEnabled) {
+        l3_noteTrigger(0U, 0.0F);
+        return;
+    }
+    if (gSelfTriggerLatched || gHwaFreezeRequested || gPostCaptureStarted) {
+        l3_noteTrigger(9U, (float)gTriggerTeePower);
+        return;
+    }
+    /* Freezing before the ring has wrapped would hand the host pre-trigger
+     * slots this session never wrote. */
+    if (gCapturePlan.preFrames == 0U || gCapturePlan.loops == 0U ||
+        gPreFramesCaptured < gCapturePlan.preFrames) {
+        l3_noteTrigger(1U, 0.0F);
+        return;
+    }
+    /* Following the ball detector, the destination is where the ball was
+     * placed, in global bins (ten captures put the club at 2.2-2.4 m while
+     * a hand-measured tee said 1.575 m). Without a locked ball the
+     * configured tee stands in, motion only, and the fallback is counted. */
+    gTrigDestBall = 0U;
+    if (gBallCfg.follow) {
+        if (l3_ball_locked(&gBall, &teeBin)) {
+            gTrigDestBall = 1U;
+        } else {
+            teeBin = gTrigCfg.teeBin;
+            gTrigFallbackFrames++;
+        }
+    }
+    if (!l3_trig_region(&gTrigCfg, teeBin, frame.binStart, frame.binCount,
+                        &first, &count)) {
+        l3_noteTrigger(2U, 0.0F);
+        return;
+    }
+    gTrigBusy = 1U;
+    windowCount = (frame.binCount > L3_TRIG_MAX_BINS) ? L3_TRIG_MAX_BINS : frame.binCount;
+    memset(&chunk, 0, sizeof(chunk));
+    /* The band first (re-placed on the noisiest idle bins near the
+     * destination until a club track freezes it): the scan plan (l3_scan.h)
+     * and the trigger's region follow it. The whole window cost ~5.1 ms of a
+     * 3 ms frame and starved the CLI and the notices, which this task
+     * outranks. */
+    if (gImpactFitCfg.bandBins > 0.0F) {
+        if (!gBandFrozen) {
+            l3_band_place(&gBandNoise, (float)teeBin, gImpactFitCfg.bandSearchBins,
+                          gImpactFitCfg.bandBins, &gBand);
+        }
+        l3_scan_pre(&gScanCfg, frame.binStart, windowCount, frame.binStart + first, count,
+                    &gBand, &region, &club, &leave);
+        if (!gClubTrack.active && !gDetectBehind) {
+            l3_scan_map_chunk(&gScanCfg, frame.binStart, windowCount, &gBand, &gMapCursor,
+                              &chunk);
+        }
+    } else {
+        gBand.valid = 0U;
+        region.first = frame.binStart + first;
+        region.count = count;
+        club = region;
+        memset(&leave, 0, sizeof(leave));
+    }
+    ticks = Cycleprofiler_getTimeStamp();
+    plan[0] = region;
+    plan[1] = club;
+    plan[2] = leave;
+    plan[3] = chunk;
+    l3_scoreSpans(&frame, plan, 4U, obs);
+    l3_profileStage(L3_PROF_RESIDUAL, ticks);
+    if (l3_detectFrameStale(&frame)) {
+        /* The slot or scratch was rewritten before this read finished. */
+        gTrigBusy = 0U;
+        l3_noteTrigger(1U, 0.0F);
+        return;
+    }
+    ticks = Cycleprofiler_getTimeStamp();
+    if (region.count > 0U) {
+        l3_trig_observe(&gTrig, gPreFramesCaptured, teeBin, region.first,
+                        &obs[region.first - frame.binStart], region.count);
+    }
+    l3_profileStage(L3_PROF_TRIGGER, ticks);
+    {
+        /* Ranked targets into the club track: the club's span of the plan. */
+        static l3_target_obs_t targets[L3_OBS_MAX_TARGETS];
+        l3_obs_params_t params;
+        uint32_t found;
+        int32_t appended;
+
+        params.stat = gTrigCfg.stat;
+        params.snr = gTrigCfg.snr;
+        params.loopPeriodS = gTrigLoopPeriodS;
+        params.subBin = gObsSubBin;
+        ticks = Cycleprofiler_getTimeStamp();
+        found = l3_preImpactClubTargets(obs, frame.binStart, &club, &leave, &params,
+                                        gTrig.floor, gPreFramesCaptured,
+                                        gPreFramesCaptured * (uint32_t)gFramePeriodUs, targets,
+                                        &left);
+        l3_profileStage(L3_PROF_EXTRACT, ticks);
+        gClubTrackDest = teeBin;
+        ticks = Cycleprofiler_getTimeStamp();
+        appended = l3_track_update(&gClubTrack, targets, found, gPreFramesCaptured,
+                                   gPreFramesCaptured * (uint32_t)gFramePeriodUs);
+        l3_profileStage(L3_PROF_CLUB_TRACK, ticks);
+        /* An active club track freezes the band where it stands; an idle
+         * frame thaws it and feeds each span it scored to the map. */
+        if (gImpactFitCfg.bandBins > 0.0F) {
+            if (gClubTrack.active) {
+                gBandFrozen = 1U;
+            } else {
+                const l3_span_t *fed[3];
+                uint32_t k;
+
+                gBandFrozen = 0U;
+                fed[0] = &club;
+                fed[1] = &leave;
+                fed[2] = &chunk;
+                for (k = 0U; k < 3U; k++) {
+                    if (fed[k]->count > 0U) {
+                        l3_band_noise_update_span(&gBandNoise, gTrigCfg.stat, frame.binStart,
+                                                  windowCount, fed[k]->first,
+                                                  &obs[fed[k]->first - frame.binStart],
+                                                  fed[k]->count);
+                    }
+                }
+            }
+        }
+        /* The club's angles leave the decision path (the fire uses range
+         * only; l3_angle_queue.h): the associated target's channels are taken
+         * now, while the frame is valid, and queued for the angle task by the
+         * point's timestamp; a fire frame drains the queue. Never shed when
+         * behind: the snapshot is cheap next to the estimate, and every point
+         * keeps its angle. The track's range-rate velocity resolves the TDM
+         * alias, so a track's first point (no range rate yet) stays
+         * range-only. */
+        if (appended && gClubTrack.lastTargetIndex < found &&
+            gClubTrack.count > 1U &&
+            l3_track_point(&gClubTrack, gClubTrack.count - 1U, &newest)) {
+            static l3_angle_snapshot_t snapshot;
+            const l3_target_obs_t *hit = &targets[gClubTrack.lastTargetIndex];
+
+            ticks = Cycleprofiler_getTimeStamp();
+            l3_channelSnapshot(&frame, (uint32_t)hit->peakBin - frame.binStart,
+                               hit->dopplerPhaseRad, newest.radialVelocityMps, &snapshot);
+            l3_angleQueuePush(newest.timestampUs, &snapshot);
+            l3_profileStage(L3_PROF_ANGLE, ticks);
+        }
+        /* The delivery and the ball position every frame: the destination bin
+         * (locked ball, else the tee), on boresight until the ball detector
+         * measures its angles. The shot machine freezes both at impact. */
+        ticks = Cycleprofiler_getTimeStamp();
+        (void)l3_track_delivery(&gClubTrack, 8U, &gDelivery);
+        if (gTrigDestBall && gBallAngleValid) {
+            l3_frames_observe(&gRadarCal, (float)teeBin * gClubTrack.cfg.binWidthM,
+                              gBallAngle.azimuthValid ? gBallAngle.azimuthRad : 0.0F,
+                              gBallAngle.elevationRad, &gBallPosition);
+        } else {
+            l3_frames_observe(&gRadarCal, (float)teeBin * gClubTrack.cfg.binWidthM, 0.0F, 0.0F,
+                              &gBallPosition);
+        }
+        {
+            /* Range only: the club-in line's crossing of the ball's range,
+             * against this frame's clock (the club coasts across the band). */
+            l3_fit_span_t clubSpan = { &gClubTrack, 0U, gClubTrack.count };
+            l3_fit_estimate_t clubIn;
+            l3_impact_club_t clubNow;
+
+            l3_impact_fit_track(&gImpactFitCfg, L3_FIT_CLUB_IN, l3_fit_span_point, &clubSpan,
+                                gClubTrack.count, (float)teeBin * gClubTrack.cfg.binWidthM,
+                                &clubIn);
+            /* The approach ending near the ball also fires: the club's return
+             * merges with the ball's at impact, short of its range. */
+            memset(&clubNow, 0, sizeof(clubNow));
+            clubNow.ballRangeM = (float)teeBin * gClubTrack.cfg.binWidthM;
+            clubNow.released = (gClubTrack.why == L3_TRACK_WHY_RELEASED) ? 1U : 0U;
+            if (appended && gClubTrack.count > 0U &&
+                l3_track_point(&gClubTrack, gClubTrack.count - 1U, &newest)) {
+                clubNow.appended = 1U;
+                clubNow.rangeM = newest.rangeM;
+                clubNow.timeUs = newest.timestampUs;
+            }
+            ranged = l3_impact_update_range(&gRangeImpact, &clubIn, &clubNow,
+                                            gPreFramesCaptured * (uint32_t)gFramePeriodUs);
+        }
+        l3_profileStage(L3_PROF_IMPACT, ticks);
+    }
+    if (gProfileReady) {
+        l3_profile_frame(&gProfile);
+    }
+    gTrigBusy = 0U;
+    /* The club track's range-only impact is the self-trigger. */
+    /* The club rules, else the ball leaving: each dates its own impact. */
+    fired = (ranged || left) ? 1 : 0;
+    impactUs = ranged ? gRangeImpact.impactTimestampUs : gLeave.impactTimestampUs;
+    if (fired) {
+        /* A stale completion (a freeze a release never waited on) would let
+         * the release stop this capture mid-tail with the request still
+         * set, and the rearm then start a post tail at once: the lock-up of
+         * 2026-09-30. l3_freezeHwaAfterPostFrames drains the same way. */
+        while (Semaphore_pend(gHwaFreezeSemaphore, BIOS_NO_WAIT)) {
+        }
+        key = Hwi_disable();
+        gHwaFreezeRequested = 1U;
+        gPostCaptureStarted = 0U;
+        gPostFramesCaptured = 0U;
+        gPostFramesObserved = 0U;
+        gActiveFrameShouldKeep = 1U;
+        gSelfTriggerLatched = 1U;
+        gHwaFreezeRequests++;
+        Hwi_restore(key);
+        gDetectEvent.flags |= (uint8_t)L3_TIMING_FLAG_FIRED;
+        /* The notice first: the host's S! waits on it, the debug line does not. */
+        l3_queueNotice("Triggered\n");
+        /* Then every pending club angle, so the shot freezes them with the
+         * trajectory, and the delivery again from them. */
+        l3_angleQueueDrain();
+        (void)l3_track_delivery(&gClubTrack, 8U, &gDelivery);
+    }
+    l3_shotObserve(teeBin, fired, impactUs);
+    if (left && gBallTrack.armed) {
+        /* The fallback fired (the club's rule may have too, as late): the
+         * ball is already too smeared to acquire, so its two points start
+         * the flight. */
+        (void)l3_ball_track_seed(&gBallTrack, &gLeave.startTarget, &gLeave.stepTarget);
+    }
+    if (!fired) {
+        l3_noteTrigger(gClubTrack.active ? 7U : 5U, gTrig.floor);
+        return;
+    }
+    l3_noteTrigger(9U, gTrig.floor);
+}
+
+#ifdef HWA_CHAINED_SNAPSHOT_RING
+static void l3_timingEnsure(void)
+{
+    if (!gTimingReady) {
+        l3_timing_init(&gTiming, gCpuClock / 1000000U, gFramePeriodUs, gCapturePlan.preFrames);
+        gTimingReady = 1U;
+    }
+}
+
+/* The detect task is done with the frame: its slot is released. */
+static void l3_detectFinish(void)
+{
+    gDetectRingEpoch = L3_DETECT_POST_EPOCH; /* nothing to re-check between frames */
+    gDetectEvent.decided = Cycleprofiler_getTimeStamp();
+    l3_timingEnsure();
+    l3_timing_record(&gTiming, &gDetectEvent);
+}
+
+static void l3_detectTask(UArg arg0, UArg arg1)
+{
+    (void)arg0;
+    (void)arg1;
+    while (1) {
+        uint16_t queuedSlot = 0U;
+        uint32_t epoch = 0U;
+        uint32_t stamp = 0U;
+        uint32_t waiting;
+
+        Semaphore_pend(gDetectSemaphore, BIOS_WAIT_FOREVER);
+        if (!l3detect_pop(&gDetectQueue, &queuedSlot, &epoch, &stamp)) {
+            continue;
+        }
+        waiting = l3detect_depth(&gDetectQueue);
+        memset(&gDetectEvent, 0, sizeof(gDetectEvent));
+        gDetectEvent.slot = queuedSlot;
+        gDetectEvent.epoch = epoch;
+        gDetectEvent.acquired = stamp;
+        gDetectEvent.dequeued = Cycleprofiler_getTimeStamp();
+        gDetectEvent.depth = (uint8_t)((waiting > 255U) ? 255U : waiting);
+        if (epoch == L3_DETECT_POST_EPOCH && queuedSlot >= gCapturePlan.preFrames) {
+            gDetectEvent.flags = (uint8_t)L3_TIMING_FLAG_POST;
+            l3_considerBallTrack(queuedSlot);
+            l3_detectFinish();
+            continue;
+        }
+        if (!l3detect_slot_live(epoch, gPreFramesCaptured, gCapturePlan.preFrames)) {
+            gDetectStale++;
+            continue;
+        }
+        /* The readers check the slot again once they have read it. */
+        gDetectRingEpoch = epoch;
+        /* Behind: a newer frame landed before this one was taken. Shed what
+         * the trigger's fire does not need (the ball detector here, the map
+         * chunk and the club's angles in the trigger) so the backlog drains
+         * and the CLI and the notices, which this task outranks, get time. */
+        gDetectBehind = ((uint32_t)(gPreFramesCaptured - epoch) >= 1U) ? 1U : 0U;
+        if (!gDetectBehind) {
+            l3_considerBall(queuedSlot);
+        } else {
+            gDetectEvent.flags |= (uint8_t)L3_TIMING_FLAG_BEHIND;
+            gDetectShed++;
+        }
+        l3_considerSelfTrigger(queuedSlot);
+        l3_detectFinish();
+    }
+}
+#endif
+
+/* The frozen frames a sparse command streams, oldest first. */
+typedef struct {
+    uint32_t slots[L3_MAX_CAPTURE_FRAMES];
+    uint8_t  starts[L3_MAX_CAPTURE_FRAMES];
+    uint8_t  counts[L3_MAX_CAPTURE_FRAMES];
+    uint32_t nFrames;
+    uint32_t maxBins;
+} l3_sparse_window_t;
+
+/* Wait until a self-trigger freeze has landed, or stop at the next frame
+ * boundary. Does not stream and does not read a follow-up CLI line.
+ * The HWA freeze only stops re-arm; the BSS keeps chirping until
+ * l3_finishCaptureStop, and MMWave_start refuses a sensor that is still running. */
+static int32_t l3_awaitFrozenRing(void)
+{
+    if (!gCaptureActive && !gSelfTriggerLatched) {
+        return -1;
+    }
+    if (gSelfTriggerLatched) {
+        if (gCaptureActive && gHwaFreezeSemaphore != NULL &&
+            !Semaphore_pend(gHwaFreezeSemaphore, 250U)) {
+            CLI_write("Error: self-trigger freeze timed out\n");
+            gSelfTriggerLatched = 0U;
+            return -1;
+        } else if (gHwaFreezeSemaphore != NULL) {
+            /* Frozen before this release: take its completion, so none is
+             * left for the next fire's release to mistake for its own. */
+            (void)Semaphore_pend(gHwaFreezeSemaphore, BIOS_NO_WAIT);
+        }
+        gSelfTriggerLatched = 0U;
+        return l3_finishCaptureStop();
+    }
+    if (l3_stopCaptureAtBoundary() != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Freeze the ring for l3sparse or l3track. A self-trigger has already
+ * requested the freeze; otherwise stop at the next frame boundary. */
+static int32_t l3_sparseFreeze(void)
+{
+#ifdef L3_RING_IQ8
+    if (l3_captureUsesIq8()) {
+        CLI_write("Error: sparse dump requires IQ16 storage\n");
+        return -1;
+    }
+#endif
+    return l3_awaitFrozenRing();
+}
+
+static void l3_sparseWindow(l3_sparse_window_t *window)
+{
+    uint32_t frame;
+    uint32_t actualPre;
+    uint32_t actualPost;
+    uint32_t oldestPre;
+
+    window->nFrames = 0U;
+    window->maxBins = 0U;
+    actualPre = (gPreFramesCaptured < gCapturePlan.preFrames)
+                    ? gPreFramesCaptured : gCapturePlan.preFrames;
+    actualPost = (gPostFramesCaptured < gCapturePlan.postFrames)
+                     ? gPostFramesCaptured : gCapturePlan.postFrames;
+    oldestPre = (gPreFramesCaptured >= gCapturePlan.preFrames)
+                    ? (gPreFramesCaptured % gCapturePlan.preFrames) : 0U;
+    for (frame = 0U; frame < actualPre && window->nFrames < L3_MAX_CAPTURE_FRAMES; frame++) {
+        window->slots[window->nFrames] = (oldestPre + frame) % gCapturePlan.preFrames;
+        window->nFrames++;
+    }
+    for (frame = 0U; frame < actualPost && window->nFrames < L3_MAX_CAPTURE_FRAMES; frame++) {
+        window->slots[window->nFrames] = gCapturePlan.preFrames + frame;
+        window->nFrames++;
+    }
+    for (frame = 0U; frame < window->nFrames; frame++) {
+        window->starts[frame] = gFrameBinStart[window->slots[frame]];
+        window->counts[frame] = gFrameBinCount[window->slots[frame]];
+        if (window->counts[frame] > window->maxBins) {
+            window->maxBins = window->counts[frame];
+        }
+    }
+}
+
+/* ILP1/ILT1 header and per-frame window table (sparse.CaptureLayout). */
+static void l3_sparseWriteHeader(const char *magic, const l3_sparse_window_t *window)
+{
+    uint32_t frame;
+
+    UART_writePolling(gDataUart, (uint8_t *)magic, 4U);
+    l3_writeU16((uint16_t)window->nFrames);
+    l3_writeU16((uint16_t)gCapturePlan.loops);
+    l3_writeU16((uint16_t)window->maxBins);
+    l3_writeU16((uint16_t)(gCapturePlan.chirpsPerFrame / gCapturePlan.loops));
+    l3_writeU16((uint16_t)N_RX);
+    l3_writeU16(window->nFrames ? window->starts[0] : 0U);
+    l3_writeU16(gFramePeriodUs);
+    /* Zero tells the host to keep its own noise floor. A summed-power median
+     * is not the per-sample floor LCMF divides by. */
+    l3_writeF32(0.0F);
+    for (frame = 0U; frame < window->nFrames; frame++) {
+        uint8_t pair[2];
+        pair[0] = window->starts[frame];
+        pair[1] = window->counts[frame];
+        UART_writePolling(gDataUart, pair, sizeof(pair));
+    }
+}
+
+/* One ILS1 cell: (frame, local bin) then the vertical TX pair's samples. */
+static void l3_sparseWriteCell(const l3_sparse_window_t *window,
+                               uint32_t frameIndex, uint32_t localBin)
+{
+    uint32_t ntx = gCapturePlan.chirpsPerFrame / gCapturePlan.loops;
+    uint32_t verticalChirps = gCapturePlan.loops * ((ntx == 3U) ? 2U : ntx);
+    uint32_t vertical;
+
+    l3_writeU16((uint16_t)frameIndex);
+    l3_writeU16((uint16_t)localBin);
+    for (vertical = 0U; vertical < verticalChirps; vertical++) {
+        uint32_t loop = vertical / ((ntx == 3U) ? 2U : ntx);
+        uint32_t which = vertical % ((ntx == 3U) ? 2U : ntx);
+        uint32_t tx = (ntx == 3U && which == 1U) ? 2U : which;
+        uint32_t chirp = loop * ntx + tx;
+        uint32_t rx;
+        for (rx = 0U; rx < N_RX; rx++) {
+            if (frameIndex >= window->nFrames || localBin >= window->counts[frameIndex]) {
+                l3_writeU16(0U);
+                l3_writeU16(0U);
+            } else {
+                const int16_t *sample = l3_iq16Sample(
+                    window->slots[frameIndex], chirp, rx, localBin);
+                l3_writeU16((uint16_t)sample[0]);
+                l3_writeU16((uint16_t)sample[1]);
+            }
+        }
+    }
+}
+
+/* Clear the capture state and restart the ring after a sparse command. */
+static int32_t l3_sparseRearm(void)
+{
+    /* A fresh pre-trigger ring: no freeze may be pending, or the first
+     * frame after the restart begins a post tail. */
+    gHwaFreezeRequested = 0U;
+    gRingFrame = 0U;
+    gHwaFreezeRequestFrame = 0U;
+    gPreFramesCaptured = 0U;
+    l3_trigRearm();
+    gPostFramesCaptured = 0U;
+    gPostFramesObserved = 0U;
+    gPostCaptureStarted = 0U;
+    gActiveFrameIsPost = 0U;
+    gActiveFrameShouldKeep = 1U;
+    l3_resetDetectQueue();
+    if (l3_restartCompletedHwaFrame() < 0) {
+        CLI_write("Error: completed HWA frame restart failed\n");
+        gCaptureActive = 0U;
+        return -1;
+    }
+    gCaptureActive = 1U;
+    if (l3_startFrontEnd() < 0) {
+        CLI_write("Error: RF restart failed\n");
+        gCaptureActive = 0U;
+        return -1;
+    }
+    return 0;
+}
+
+/* CLI "l3release": rearm after a self-trigger without streaming the power
+ * map. The SCI receiver holds one byte, so a cell line written while that
+ * map is going out is lost before l3_readLine runs. */
+static int32_t l3_cli_release(int32_t argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+    if (l3_awaitFrozenRing() != 0) {
+        return -1;
+    }
+    return l3_sparseRearm();
+}
+
+int32_t l3_cli_sparse(int32_t argc, char *argv[])
+{
+    l3_sparse_window_t window;
+    uint32_t frame;
+    char request[L3_SPARSE_REQUEST_MAX];
+    static uint16_t cellFrames[L3_SPARSE_REQUEST_MAX / 4U];
+    static uint16_t cellBins[L3_SPARSE_REQUEST_MAX / 4U];
+    static float powerRow[L3_MAX_LOOPS * L3_RING_MAX_BINS] L3_HSRAM_DIAG;
+    char *cursor;
+    char *next;
+    int32_t lineStatus;
+    int32_t cellCount;
+    int32_t cell;
+    (void)argc;
+    (void)argv;
+    if (l3_sparseFreeze() != 0) {
+        return -1;
+    }
+    l3_sparseWindow(&window);
+    l3_sparseWriteHeader("ILP1", &window);
+    for (frame = 0U; frame < window.nFrames; frame++) {
+        uint32_t loop;
+        uint32_t bin;
+        uint32_t maxBins = window.maxBins;
+        float perLoop[L3_MAX_LOOPS];
+        for (bin = 0U; bin < maxBins; bin++) {
+            if (bin < window.counts[frame]) {
+                l3_verticalPowerLoops(window.slots[frame], bin, perLoop);
+            }
+            for (loop = 0U; loop < gCapturePlan.loops; loop++) {
+                powerRow[loop * maxBins + bin] =
+                    (bin < window.counts[frame]) ? perLoop[loop] : 0.0F;
+            }
+        }
+        for (loop = 0U; loop < gCapturePlan.loops; loop++) {
+            UART_writePolling(gDataUart, (uint8_t *)&powerRow[loop * maxBins],
+                              maxBins * sizeof(float));
+        }
+    }
+    lineStatus = l3_readLine(request, sizeof(request));
+    /* A stray CR/LF in the FIFO is not the cell request. "\r\n" is two empty
+     * reads; skip those and take the line that follows. A timeout is not
+     * retried, so a missing request still fails in one 5s wait. */
+    if (lineStatus == L3_READLINE_EMPTY) {
+        uint32_t emptyReads = 1U;
+        while (lineStatus == L3_READLINE_EMPTY && emptyReads < 3U) {
+            emptyReads++;
+            lineStatus = l3_readLine(request, sizeof(request));
+        }
+    }
+    if (lineStatus == L3_READLINE_OVERFLOW) {
+        CLI_write("Error: sparse cell request longer than L3_SPARSE_REQUEST_MAX\n");
+        return l3_sparseRearm();
+    }
+    if (lineStatus != 0) {
+        CLI_write("Error: sparse cell request missing\n");
+        return l3_sparseRearm();
+    }
+    cursor = request;
+    while (*cursor != '\0' && *cursor != ' ') {
+        cursor++;
+    }
+    cellCount = 0;
+    if (*cursor == ' ') {
+        long claimed = strtol(cursor, &cursor, 10);
+        while (claimed > 0 && cellCount < (int32_t)(sizeof(cellFrames) / sizeof(cellFrames[0]))) {
+            long frameValue = strtol(cursor, &next, 10);
+            long binValue;
+            if (next == cursor) {
+                break;
+            }
+            cursor = next;
+            binValue = strtol(cursor, &next, 10);
+            if (next == cursor) {
+                break;
+            }
+            cursor = next;
+            cellFrames[cellCount] = (uint16_t)((frameValue < 0) ? 0 : frameValue);
+            cellBins[cellCount] = (uint16_t)((binValue < 0) ? 0 : binValue);
+            cellCount++;
+            claimed--;
+        }
+    }
+    UART_writePolling(gDataUart, (uint8_t *)"ILS1", 4U);
+    l3_writeU16((uint16_t)cellCount);
+    for (cell = 0; cell < cellCount; cell++) {
+        l3_sparseWriteCell(&window, cellFrames[cell], cellBins[cell]);
+    }
+    return l3_sparseRearm();
+}
+
+/* Firmware ball tracker (track_select.c). trackCfg supplies the rig limits;
+ * the algorithm constants live in l3track_default_params. */
+static L3TrackWorkspace gTrackWorkspace;
+static L3TrackParams gTrackParams;
+static double gTrackLoopPeriodS;
+static double gTrackRangeResM;
+static uint8_t gTrackConfigured;
+
+static void l3_trackRow(void *ctx, uint32_t frame, uint32_t loop,
+                        float *out, uint32_t count)
+{
+    const l3_sparse_window_t *window = (const l3_sparse_window_t *)ctx;
+    uint32_t bin;
+
+    for (bin = 0U; bin < count; bin++) {
+        float perLoop[L3_MAX_LOOPS];
+
+        l3_verticalPowerLoops(window->slots[frame], bin, perLoop);
+        out[bin] = perLoop[loop];
+    }
+}
+
+/* CLI "l3track": freeze, find the ball and club cells on-chip, then stream
+ * an ILT1 layout + track record and the ILS1 cells. No host round trip. */
+int32_t l3_cli_track(int32_t argc, char *argv[])
+{
+    l3_sparse_window_t window;
+    L3TrackLayout layout;
+    L3TrackResult result;
+    L3TrackRng rng;
+    int32_t cellCount;
+    uint32_t frame;
+    (void)argc;
+    (void)argv;
+    if (!gTrackConfigured) {
+        CLI_write("Error: l3track needs trackCfg\n");
+        return -1;
+    }
+    if (l3_sparseFreeze() != 0) {
+        return -1;
+    }
+    l3_sparseWindow(&window);
+    layout.nFrames = window.nFrames;
+    layout.nLoops = gCapturePlan.loops;
+    layout.maxBins = window.maxBins;
+    layout.binStarts = window.starts;
+    layout.binCounts = window.counts;
+    /* sparse._parse_layout: a zero period reads as 3 ms. */
+    layout.framePeriodS = (gFramePeriodUs != 0U) ? ((double)gFramePeriodUs / 1e6) : 0.003;
+    layout.loopPeriodS = gTrackLoopPeriodS;
+    layout.rangeResM = gTrackRangeResM;
+    l3track_rng_seed(&rng, 1U);
+    cellCount = l3track_select(&layout, &gTrackParams, l3_trackRow, &window,
+                               l3track_rng_pair, &rng, &gTrackWorkspace, &result);
+    if (cellCount < 0) {
+        CLI_write("Error: track layout exceeds firmware limits\n");
+        (void)l3_sparseRearm();
+        return -1;
+    }
+    l3_sparseWriteHeader("ILT1", &window);
+    l3_writeU16(result.found ? 1U : 0U);
+    l3_writeU16((uint16_t)result.nInliers);
+    l3_writeF32((float)result.slopeBins);
+    l3_writeF32((float)result.interceptBins);
+    l3_writeF32((float)result.rmsBins);
+    l3_writeF32((float)result.tFirstS);
+    l3_writeF32((float)result.tLastS);
+    UART_writePolling(gDataUart, (uint8_t *)"ILS1", 4U);
+    l3_writeU16((uint16_t)cellCount);
+    for (frame = 0U; frame < window.nFrames; frame++) {
+        uint32_t bin;
+        for (bin = 0U; bin < L3T_MAX_BINS; bin++) {
+            if (((gTrackWorkspace.cellMask[frame] >> bin) & 1U) != 0U) {
+                l3_sparseWriteCell(&window, frame, bin);
+            }
+        }
+    }
+    return l3_sparseRearm();
+}
+
+/* Parse count floats from argv[first..], any value; 0 on success. */
+static int32_t l3_parseFloats(int32_t argc, char *argv[], int32_t first, uint32_t count,
+                              float *values)
+{
+    uint32_t i;
+
+    if (argc != first + (int32_t)count) {
+        return -1;
+    }
+    for (i = 0U; i < count; i++) {
+        char *end;
+        double value = strtod(argv[first + (int32_t)i], &end);
+
+        if (*end != '\0' || end == argv[first + (int32_t)i]) {
+            return -1;
+        }
+        values[i] = (float)value;
+    }
+    return 0;
+}
+
+/* "trackCfg cal <pitchDeg> <yawDeg> <rollDeg> <azOffsetRad> <elOffsetDeg>
+ * <rangeBiasM>": the enclosure attitude and the baseline zeros of
+ * l3_frames.h. Takes effect for the club track on the next triggerCfg. */
+static int32_t l3_cli_trackCfgCal(int32_t argc, char *argv[])
+{
+    float values[6];
+
+    if (l3_parseFloats(argc, argv, 2, 6U, values) != 0) {
+        CLI_write("Error: trackCfg cal <pitchDeg> <yawDeg> <rollDeg> <azOffsetRad> "
+                  "<elOffsetDeg> <rangeBiasM>\n");
+        return -1;
+    }
+    l3_ensureRadarCal();
+    gRadarCal.radarPitchRad = values[0] * (L3_FRAMES_PI / 180.0F);
+    gRadarCal.radarYawRad = values[1] * (L3_FRAMES_PI / 180.0F);
+    gRadarCal.radarRollRad = values[2] * (L3_FRAMES_PI / 180.0F);
+    gRadarCal.azimuthOffsetRad = values[3];
+    gRadarCal.elevationOffsetRad = values[4] * (L3_FRAMES_PI / 180.0F);
+    gRadarCal.rangeBiasM = values[5];
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "trackCfg elem <index> <phaseRad> <gain>": one virtual element's
+ * correction in PHYSICAL order, as the calibration file stores it:
+ * correction = exp(-j phase) / gain. */
+static int32_t l3_cli_trackCfgElem(int32_t argc, char *argv[])
+{
+    float values[3];
+    uint32_t index;
+
+    if (l3_parseFloats(argc, argv, 2, 3U, values) != 0 || values[0] < 0.0F ||
+        values[0] >= (float)L3_CAL_MAX_VIRTUAL || values[2] <= 0.0F) {
+        CLI_write("Error: trackCfg elem <index 0..7> <phaseRad> <gain>\n");
+        return -1;
+    }
+    l3_ensureRadarCal();
+    index = (uint32_t)values[0];
+    if (l3_cal_set_element(&gRadarCal, index, values[2], values[1]) != 0) {
+        CLI_write("Error: trackCfg elem <index 0..7> <phaseRad> <gain>\n");
+        return -1;
+    }
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "trackCfg impact <horizonS> [endM [endMinMps [endOnRelease]]]": the
+ * range-only impact fires when the club's crossing of the ball's range is
+ * within horizonS of the frame's time, or when an approach at least
+ * endMinMps, last seen within endM short of the ball, ends (endM 0 turns that
+ * off; endMinMps 0 lets any usable approach arm it; endOnRelease 1 lets a
+ * release end it too; left out keeps them). The geometric detector's
+ * tolerance, speed, confidence and armed values went with it (2026-09-30),
+ * so the old five-value line is refused. */
+static int32_t l3_cli_trackCfgImpact(int32_t argc, char *argv[])
+{
+    float values[4];
+    uint32_t count = (argc >= 4) ? (uint32_t)(argc - 2) : 1U;
+
+    if (count > 4U || l3_parseFloats(argc, argv, 2, count, values) != 0 ||
+        values[0] <= 0.0F ||
+        (count >= 2U && (values[1] < 0.0F || values[1] > L3_IMPACT_END_MAX_M)) ||
+        (count >= 3U && (values[2] < 0.0F || values[2] > L3_IMPACT_END_MAX_MPS)) ||
+        (count == 4U && values[3] != 0.0F && values[3] != 1.0F)) {
+        CLI_write("Error: trackCfg impact <horizonS> [endM 0..2 [endMinMps 0..70 "
+                  "[endOnRelease 0|1]]]\n");
+        return -1;
+    }
+    l3_ensureRadarCal();  /* also fills the impact cfg's defaults once */
+    gImpactCfg.horizonS = values[0];
+    if (count >= 2U) {
+        gImpactCfg.endM = values[1];
+    }
+    if (count >= 3U) {
+        gImpactCfg.endMinMps = values[2];
+    }
+    if (count == 4U) {
+        gImpactCfg.endOnRelease = (values[3] != 0.0F) ? 1U : 0U;
+    }
+    l3_impact_init(&gRangeImpact, &gImpactCfg);
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* --- the MSS <-> DSS detect link (l3_dsp_ipc.h) ------------------------------
+ * Phase 0 of moving the detect task to the DSS: dspPing, and dspProbe, which
+ * scores the newest pre-impact ring frame on both cores with the same code
+ * and compares. Then SCORE: the live detector's bins (l3_scoreSpans), on
+ * the core "trackCfg detectCore" chooses (l3_detect_core.h). The DSS clocks
+ * at 600 MHz.
+ *
+ * Two 3-ms frames is as long as the detect task waits for an answer (BIOS
+ * ticks are 1 ms): a DSS that does not answer costs that frame the wait and
+ * the MSS's own scoring, and three in a row latch the MSS. The CLI's
+ * commands wait as long per read. One request is in flight at a time:
+ * gDspLinkLock is held across each exchange by the CLI and the detect task
+ * both, and the detect task never waits for it. */
+#define L3_DSP_REPLY_TIMEOUT_TICKS 6U /* ms: two 3-ms frames */
+#define L3_DSS_CLOCK_MHZ 600U
+#define L3_DSP_STALE_REPLIES 3U
+/* The detect line with every counter at its widest and a mismatch: ~300. */
+#define L3_DETECT_LINE_BYTES 320U
+
+static Mbox_Handle gDspLink = NULL;
+static Semaphore_Handle gDspLinkLock = NULL;
+static uint32_t gDspSeq = 0U;
+
+static void l3_dspLinkOpen(void)
+{
+    Mailbox_Config cfg;
+    int32_t errCode = 0;
+
+    if (Mailbox_Config_init(&cfg) < 0) {
+        return;
+    }
+    cfg.readMode = MAILBOX_MODE_BLOCKING;
+    cfg.readTimeout = L3_DSP_REPLY_TIMEOUT_TICKS;
+    cfg.writeMode = MAILBOX_MODE_BLOCKING;
+    cfg.writeTimeout = L3_DSP_REPLY_TIMEOUT_TICKS;
+    cfg.chType = MAILBOX_CHTYPE_MULTI;
+    cfg.chId = MAILBOX_CH_ID_0;
+    gDspLink = Mailbox_open(MAILBOX_TYPE_DSS, &cfg, &errCode);
+    if (errCode != 0) {
+        gDspLink = NULL;
+        return;
+    }
+    {
+        Semaphore_Params lockParams;
+
+        Semaphore_Params_init(&lockParams);
+        lockParams.mode = Semaphore_Mode_BINARY;
+        gDspLinkLock = Semaphore_create(1, &lockParams, NULL);
+    }
+    if (gDspLinkLock == NULL) {
+        gDspLink = NULL; /* unguarded, the CLI and the detect task could interleave */
+    }
+}
+
+/* 0 with the link held, or -1: no link, or someone else is using it. */
+static int32_t l3_dspLinkTryLock(void)
+{
+    if (gDspLink == NULL || gDspLinkLock == NULL) {
+        return -1;
+    }
+    return Semaphore_pend(gDspLinkLock, BIOS_NO_WAIT) ? 0 : -1;
+}
+
+static void l3_dspLinkUnlock(void)
+{
+    if (gDspLinkLock != NULL) {
+        Semaphore_post(gDspLinkLock);
+    }
+}
+
+/* The CLI's hold on the link: waits out a frame the detect task is on. */
+static int32_t l3_dspLinkLock(void)
+{
+    if (gDspLink == NULL || gDspLinkLock == NULL) {
+        return -1;
+    }
+    return Semaphore_pend(gDspLinkLock, 4U * L3_DSP_REPLY_TIMEOUT_TICKS) ? 0 : -1;
+}
+
+/* Send a request with the next sequence number. 0, or -1 with no link or a
+ * failed write. The caller holds the link. */
+static int32_t l3_dspSend(l3_dsp_request_t *request)
+{
+    if (gDspLink == NULL) {
+        return -1;
+    }
+    request->magic = L3_DSP_MAGIC;
+    request->seq = ++gDspSeq;
+    if (Mailbox_write(gDspLink, (const uint8_t *)request, sizeof(*request)) !=
+        (int32_t)sizeof(*request)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Wait for the reply to request. A reply to an earlier request that timed
+ * out may still be queued: skip up to a few. 0, or -1 with no link or no
+ * matching reply. The caller holds the link. */
+static int32_t l3_dspAwait(const l3_dsp_request_t *request, l3_dsp_reply_t *reply)
+{
+    uint32_t attempt;
+
+    if (gDspLink == NULL) {
+        return -1;
+    }
+    for (attempt = 0U; attempt < L3_DSP_STALE_REPLIES; attempt++) {
+        int32_t got = Mailbox_read(gDspLink, (uint8_t *)reply, sizeof(*reply));
+
+        (void)Mailbox_readFlush(gDspLink);
+        if (got != (int32_t)sizeof(*reply)) {
+            return -1;
+        }
+        if (reply->magic == L3_DSP_MAGIC && reply->seq == request->seq) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* The CLI's round trip: hold the link, send, wait. */
+static int32_t l3_dspExchange(l3_dsp_request_t *request, l3_dsp_reply_t *reply)
+{
+    int32_t status;
+
+    if (l3_dspLinkLock() != 0) {
+        return -1;
+    }
+    status = l3_dspSend(request);
+    if (status == 0) {
+        status = l3_dspAwait(request, reply);
+    }
+    l3_dspLinkUnlock();
+    return status;
+}
+
+/* SCORE's result block in HS-RAM, at the MSS's address for it. */
+static const volatile l3_dsp_result_t *l3_dspResultBlock(void)
+{
+    return (const volatile l3_dsp_result_t *)(SOC_XWR68XX_MSS_HSRAM_BASE_ADDRESS +
+                                              L3_DSP_RESULT_HSRAM_OFFSET);
+}
+
+/* l3_scoreSpans on the DSS (route dss) or on both cores at once (verify),
+ * the link held. dss: the DSS's observations are used; a DSS that fails the
+ * frame has the MSS score it (a fallback). verify: the SCORE request goes
+ * first so the DSS works while the MSS scores the same bins, then the two
+ * are compared bit for bit and the MSS's are used whatever the DSS did. */
+static void l3_dspScoreSpans(const l3_detect_frame_t *frame, const l3_span_t *local, uint32_t n,
+                             l3_trig_obs_t *obs, uint32_t *scored, uint32_t route)
+{
+    /* Static: the detect task's stack is small; only this task uses it. */
+    static l3_dsp_result_t result;
+    l3_dsp_request_t request;
+    l3_dsp_reply_t reply;
+    uint32_t outcome = L3_DETECT_OUTCOME_FAILED;
+    uint32_t bin = 0U;
+    uint32_t field = 0U;
+    uint32_t ticks;
+    uint32_t k;
+    int32_t sent;
+
+    memset(&request, 0, sizeof(request));
+    memset(&result, 0, sizeof(result));
+    request.cmd = L3_DSP_CMD_SCORE;
+    request.frameOffset = (uint32_t)((uintptr_t)frame->base - SOC_XWR68XX_MSS_L3RAM_BASE_ADDRESS);
+    request.binCount = frame->binCount;
+    request.ntx = gCapturePlan.chirpsPerFrame / gCapturePlan.loops;
+    request.loops = gCapturePlan.loops;
+    request.epoch = gDetectEvent.epoch;
+    request.nSpans = n;
+    for (k = 0U; k < n; k++) {
+        request.spanFirst[k] = local[k].first;
+        request.spanCount[k] = local[k].count;
+    }
+    sent = l3_dspSend(&request);
+    if (route == L3_DETECT_CORE_VERIFY) {
+        l3_mssScoreSpans(frame, local, n, obs, scored);
+    }
+    ticks = Cycleprofiler_getTimeStamp();
+    if (sent == 0 && l3_dspAwait(&request, &reply) == 0) {
+        /* A snapshot: checked and read from one copy, not live HS-RAM. */
+        memcpy(&result, (const void *)l3_dspResultBlock(), sizeof(result));
+        if (l3_dsp_result_check(&result, request.seq, request.epoch) == L3_DSP_OK) {
+            outcome = L3_DETECT_OUTCOME_OK;
+        }
+    }
+    l3_profileStage(L3_PROF_DSP_WAIT, ticks);
+    if (route == L3_DETECT_CORE_VERIFY) {
+        if (outcome == L3_DETECT_OUTCOME_OK &&
+            !l3_dsp_result_compare(&result, obs, scored, &bin, &field)) {
+            outcome = L3_DETECT_OUTCOME_MISMATCH;
+            l3_detect_core_note_mismatch(&gDetectCore, gDetectEvent.slot, bin, field);
+        }
+    } else if (outcome == L3_DETECT_OUTCOME_OK) {
+        (void)l3_dsp_result_merge(&result, obs, scored);
+    } else {
+        gDetectEvent.core = (uint8_t)L3_TIMING_CORE_FALLBACK;
+        l3_mssScoreSpans(frame, local, n, obs, scored);
+    }
+    if (outcome == L3_DETECT_OUTCOME_FAILED) {
+        result.invCycles = 0U;
+        result.scoreCycles = 0U;
+    }
+    if (l3_detect_core_report(&gDetectCore, route, outcome, result.invCycles,
+                              result.scoreCycles) != 0) {
+        /* No "Error": the host fails any command whose reply carries one. */
+        l3_queueNotice("dsp detect latched to mss\n");
+    }
+}
+
+/* The DSS's boot status (l3_dsp_ipc.h), read from HS-RAM: where a DSS that
+ * does not answer stopped. */
+static void l3_dspPrintStatus(void)
+{
+    l3_dsp_status_t status;
+    char line[96];
+
+    memcpy(&status,
+           (const void *)(SOC_XWR68XX_MSS_HSRAM_BASE_ADDRESS + L3_DSP_STATUS_HSRAM_OFFSET),
+           sizeof(status));
+    (void)l3_dsp_status_format(&status, line, sizeof(line));
+    CLI_write("%s\n", line);
+}
+
+/* The DSS as the MSS sees it without the DSS's help (l3_dsp_ipc.h): its
+ * halt and power state, the ROM self-test flag, the ESM error status, the
+ * stage mirrored into DSSGPREG0, and whether HS-RAM reads back here. */
+#define L3_DSSREG_GEMPWRSMCFG3 0x2C8U
+#define L3_DSSREG_GEMPWRSMCFG4 0x2CCU
+#define L3_DSS_STC_STATUS      0x50040014U /* bit 0: the ROM ran the DSS STC */
+#define L3_HSRAM_PROBE_OFFSET  0x7E00U     /* an unused HS-RAM word */
+
+static uint32_t l3_readReg(uint32_t address)
+{
+    return *(volatile const uint32_t *)address;
+}
+
+static void l3_dspPrintHw(void)
+{
+    l3_dsp_hw_t hw;
+    volatile uint32_t *probe =
+        (volatile uint32_t *)(SOC_XWR68XX_MSS_HSRAM_BASE_ADDRESS + L3_HSRAM_PROBE_OFFSET);
+    char line[160];
+
+    hw.gpreg = l3_readReg(SOC_XWR68XX_MSS_DSSREG_BASE_ADDRESS);
+    hw.halt = (l3_readReg(SOC_XWR68XX_MSS_DSSREG_BASE_ADDRESS + L3_DSSREG_GEMPWRSMCFG4) >> 17U) & 1U;
+    hw.power = (l3_readReg(SOC_XWR68XX_MSS_DSSREG_BASE_ADDRESS + L3_DSSREG_GEMPWRSMCFG3) >> 18U) & 3U;
+    hw.stc = l3_readReg(L3_DSS_STC_STATUS) & 1U;
+    hw.esm[0] = l3_readReg(SOC_XWR68XX_MSS_ESM_BASE_ADDRESS + 0x18U); /* ESMSR1 */
+    hw.esm[1] = l3_readReg(SOC_XWR68XX_MSS_ESM_BASE_ADDRESS + 0x1CU); /* ESMSR2 */
+    hw.esm[2] = l3_readReg(SOC_XWR68XX_MSS_ESM_BASE_ADDRESS + 0x20U); /* ESMSR3 */
+    hw.esm[3] = l3_readReg(SOC_XWR68XX_MSS_ESM_BASE_ADDRESS + 0x58U); /* ESMSR4 */
+    *probe = 0xA5C3F00DU;
+    hw.hsramOk = (*probe == 0xA5C3F00DU) ? 1U : 0U;
+    *probe = 0x5A3C0FF2U;
+    hw.hsramOk = (hw.hsramOk != 0U && *probe == 0x5A3C0FF2U) ? 1U : 0U;
+    (void)l3_dsp_hw_format(&hw, line, sizeof(line));
+    CLI_write("%s\n", line);
+}
+
+static uint32_t l3_cyclesToUs(uint32_t cycles)
+{
+    return cycles / (gCpuClock / 1000000U);
+}
+
+/* "trackCfg dsp ping": the DSS answers over the mailbox. */
+static int32_t l3_dspPing(void)
+{
+    l3_dsp_request_t request;
+    l3_dsp_reply_t reply;
+    uint32_t ticks;
+
+    memset(&request, 0, sizeof(request));
+    request.cmd = L3_DSP_CMD_PING;
+    ticks = Cycleprofiler_getTimeStamp();
+    if (l3_dspExchange(&request, &reply) != 0) {
+        l3_dspPrintStatus();
+        l3_dspPrintHw();
+        CLI_write("Error: DSP did not answer (link %s)\n", gDspLink == NULL ? "closed" : "open");
+        return -1;
+    }
+    CLI_write("dsp pong seq=%u us=%u\n", (unsigned)reply.seq,
+              (unsigned)l3_cyclesToUs(Cycleprofiler_getTimeStamp() - ticks));
+    return 0;
+}
+
+static uint32_t l3_floatBits(float value)
+{
+    uint32_t bits;
+
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+/* "trackCfg dsp probe [bins]": score the newest pre-impact ring frame (its
+ * first bins; all by default) on the MSS, then on the DSS, and compare bit
+ * for bit. The ring slot is not rewritten for preFrames frames, far longer
+ * than either core takes. IQ16 rings only: the shared scoring reads int16. */
+static int32_t l3_dspProbe(int32_t argc, char *argv[])
+{
+    l3_dsp_request_t request;
+    l3_dsp_reply_t mss;
+    l3_dsp_reply_t dss;
+    uint32_t slot;
+    uint32_t ticks;
+    uint32_t mssUs;
+    uint32_t match;
+
+    if (gPreFramesCaptured == 0U || gCapturePlan.preFrames == 0U || gCapturePlan.loops == 0U) {
+        CLI_write("Error: no frame captured yet (sensorStart first)\n");
+        return -1;
+    }
+    if (l3_ringComponentBytes() != 2U) {
+        CLI_write("Error: dspProbe needs an IQ16 ring (captureFormat iq16)\n");
+        return -1;
+    }
+    slot = (gPreFramesCaptured - 1U) % gCapturePlan.preFrames;
+    memset(&request, 0, sizeof(request));
+    request.magic = L3_DSP_MAGIC;
+    request.cmd = L3_DSP_CMD_PROBE;
+    request.frameOffset =
+        (uint32_t)(uintptr_t)&g_ring[gFrameOffset[slot]] - SOC_XWR68XX_MSS_L3RAM_BASE_ADDRESS;
+    request.binCount = gFrameBinCount[slot];
+    request.firstBin = 0U;
+    request.nBins = (argc > 3) ? (uint32_t)atoi(argv[3]) : request.binCount;
+    request.ntx = gCapturePlan.chirpsPerFrame / gCapturePlan.loops;
+    request.loops = gCapturePlan.loops;
+
+    ticks = Cycleprofiler_getTimeStamp();
+    l3_dsp_probe_run(&request, (const uint8_t *)SOC_XWR68XX_MSS_L3RAM_BASE_ADDRESS,
+                     L3_TOTAL_BYTES, &mss);
+    mssUs = l3_cyclesToUs(Cycleprofiler_getTimeStamp() - ticks);
+    if (mss.status != L3_DSP_OK) {
+        CLI_write("Error: probe refused (status %u)\n", (unsigned)mss.status);
+        return -1;
+    }
+    if (l3_dspExchange(&request, &dss) != 0) {
+        l3_dspPrintStatus();
+        l3_dspPrintHw();
+        CLI_write("Error: DSP did not answer (link %s)\n", gDspLink == NULL ? "closed" : "open");
+        return -1;
+    }
+    match = (dss.status == L3_DSP_OK && dss.nBins == mss.nBins &&
+             l3_floatBits(dss.energySum) == l3_floatBits(mss.energySum) &&
+             l3_floatBits(dss.r1ReSum) == l3_floatBits(mss.r1ReSum) &&
+             l3_floatBits(dss.r1ImSum) == l3_floatBits(mss.r1ImSum)) ? 1U : 0U;
+    /* dss_us is the scoring; dss_prep_us what preparing the frame cost first
+     * (the gather into L2, or the invalidate over L3), gathered which. */
+    CLI_write("dsp probe slot=%u bins=%u mss_us=%u dss_us=%u dss_cycles=%u match=%u "
+              "status=%u mss_energy=%08x dss_energy=%08x dss_prep_us=%u gathered=%u\n",
+              (unsigned)slot, (unsigned)mss.nBins, (unsigned)mssUs,
+              (unsigned)(dss.cycles / L3_DSS_CLOCK_MHZ), (unsigned)dss.cycles,
+              (unsigned)match, (unsigned)dss.status,
+              (unsigned)l3_floatBits(mss.energySum), (unsigned)l3_floatBits(dss.energySum),
+              (unsigned)(dss.prepCycles / L3_DSS_CLOCK_MHZ), (unsigned)dss.gathered);
+    return match ? 0 : -1;
+}
+
+/* "trackCfg dsp ping | probe [bins] | status | hw": the detect link's
+ * diagnostics. A trackCfg sub-mode: the CLI table is at the SDK's
+ * CLI_MAX_CMD. */
+static int32_t l3_cli_trackCfgDsp(int32_t argc, char *argv[])
+{
+    if (argc == 3 && strcmp(argv[2], "status") == 0) {
+        l3_dspPrintStatus();
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[2], "hw") == 0) {
+        l3_dspPrintHw();
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[2], "ping") == 0) {
+        return l3_dspPing();
+    }
+    if ((argc == 3 || argc == 4) && strcmp(argv[2], "probe") == 0) {
+        return l3_dspProbe(argc, argv);
+    }
+    CLI_write("Error: trackCfg dsp ping | probe [bins] | status | hw\n");
+    return -1;
+}
+
+/* Timing starts over with each session (the plan's ring and frame interval
+ * may have changed) and with each core chosen, so an A/B run's numbers are
+ * its own. */
+static void l3_timingRestart(void)
+{
+    gTimingReady = 0U;
+    gDetectStaleAfterRead = 0U;
+}
+
+/* "trackCfg detectCore [dss|verify]": how the detector's bins are scored
+ * (l3_detect_core.h). Bare, or after a change, the detect line. verify needs
+ * an IQ16 ring and the DSS link; dss takes any capture, the frames the DSS
+ * cannot take scored on the MSS. Choosing a core clears a latch and starts
+ * the counts and the timing over. A trackCfg sub-mode: the CLI table is at
+ * the SDK's CLI_MAX_CMD. */
+static int32_t l3_cli_trackCfgDetectCore(int32_t argc, char *argv[])
+{
+    static char line[L3_DETECT_LINE_BYTES] L3_HSRAM_DIAG;
+    uint32_t which;
+
+    l3_detectCoreEnsure();
+    if (argc == 3) {
+        uint8_t eligible = (uint8_t)(l3_ringComponentBytes() == 2U && !l3_captureCompactsIq16() &&
+                                     gDspLink != NULL);
+
+        if (l3_detect_core_parse(argv[2], &which) != 0) {
+            CLI_write("Error: trackCfg detectCore dss|verify\n");
+            return -1;
+        }
+        if (l3_detect_core_set(&gDetectCore, which, eligible) != 0) {
+            CLI_write("Error: detectCore %s needs %s\n", argv[2],
+                      (gDspLink == NULL) ? "the DSS link (trackCfg dsp status)"
+                                         : "an IQ16 ring (captureFormat iq16)");
+            return -1;
+        }
+        l3_detect_core_reset_counts(&gDetectCore);
+        l3_timingRestart();
+    } else if (argc != 2) {
+        CLI_write("Error: trackCfg detectCore [dss|verify]\n");
+        return -1;
+    }
+    (void)l3_detect_core_format(&gDetectCore, L3_DSS_CLOCK_MHZ, line, sizeof(line));
+    CLI_write("%s\n", line);
+    return 0;
+}
+
+/* "trackCfg impactFit <bandBins>": the tee band's total width in range bins
+ * (l3_band.h), placed on the noisiest idle bins near the tee; 0 for no band. A sub-mode, not a command of its own: the CLI
+ * table is at the SDK's CLI_MAX_CMD. Kept across triggerCfg and sensorStart;
+ * the next pre-impact frame places the band. */
+static int32_t l3_cli_trackCfgImpactFit(int32_t argc, char *argv[])
+{
+    float values[1];
+
+    /* !(>= 0) also refuses a NaN strtof accepted. */
+    if (l3_parseFloats(argc, argv, 2, 1U, values) != 0 || !(values[0] >= 0.0F) ||
+        values[0] > L3_IMPACT_FIT_MAX_BAND_BINS) {
+        CLI_write("Error: trackCfg impactFit <bandBins 0..64>\n");
+        return -1;
+    }
+    l3_ensureRadarCal();
+    gImpactFitCfg.bandBins = values[0];
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "trackCfg ballSnr <snr>": the ball tracker's extraction threshold over its
+ * floor, set apart from triggerCfg's; 0 restores the firmware default
+ * (l3_ball_track_cfg_defaults). A sub-mode for the same reason as impactFit. */
+static int32_t l3_cli_trackCfgBallSnr(int32_t argc, char *argv[])
+{
+    float values[1];
+
+    /* Below the floor every bin is a target; !(...) also refuses NaN. */
+    if (l3_parseFloats(argc, argv, 2, 1U, values) != 0 ||
+        !(values[0] == 0.0F || values[0] >= 1.0F) || values[0] > L3_BALL_SNR_MAX) {
+        CLI_write("Error: trackCfg ballSnr <snr: 0 = default, 1..1e6>\n");
+        return -1;
+    }
+    gBallSnr = values[0];
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* CLI "trackCfg <loopPeriodS> <rangeResM> <maxRangeM> <clubLoM> <clubHiM>":
+ * the rig limits from IWR6843Runtime.track_config_command. maxRangeM of 0
+ * disables the net clamp; clubHiM <= clubLoM disables the club cells.
+ * Sub-modes cal, elem, impact and impactFit configure the geometry stack above;
+ * ballSnr the ball tracker's threshold. */
+static int32_t l3_cli_trackCfg(int32_t argc, char *argv[])
+{
+    double values[5];
+    char *end;
+    int32_t i;
+
+    if (argc >= 2 && strcmp(argv[1], "cal") == 0) {
+        return l3_cli_trackCfgCal(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "elem") == 0) {
+        return l3_cli_trackCfgElem(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "impact") == 0) {
+        return l3_cli_trackCfgImpact(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "impactFit") == 0) {
+        return l3_cli_trackCfgImpactFit(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "dsp") == 0) {
+        return l3_cli_trackCfgDsp(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "detectCore") == 0) {
+        return l3_cli_trackCfgDetectCore(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "ballSnr") == 0) {
+        return l3_cli_trackCfgBallSnr(argc, argv);
+    }
+    if (argc == 3 && strcmp(argv[1], "subbin") == 0) {
+        /* "trackCfg subbin centroid|parabolic": how targets read their
+         * sub-bin range (l3_observation.h). */
+        if (strcmp(argv[2], "centroid") == 0) {
+            gObsSubBin = L3_OBS_SUBBIN_CENTROID;
+        } else if (strcmp(argv[2], "parabolic") == 0) {
+            gObsSubBin = L3_OBS_SUBBIN_PARABOLIC;
+        } else {
+            CLI_write("Error: trackCfg subbin centroid|parabolic\n");
+            return -1;
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc != 6) {
+        CLI_write("Error: trackCfg <loopPeriodS> <rangeResM> <maxRangeM> <clubLoM> <clubHiM> "
+                  "| cal ... | elem ... | impact ... | impactFit ... | ballSnr ... | subbin ...\n");
+        return -1;
+    }
+    for (i = 0; i < 5; i++) {
+        values[i] = strtod(argv[i + 1], &end);
+        if (*end != '\0' || !(values[i] >= 0.0)) {
+            CLI_write("Error: trackCfg value\n");
+            return -1;
+        }
+    }
+    if (values[0] <= 0.0 || values[1] <= 0.0) {
+        CLI_write("Error: trackCfg period and resolution must be positive\n");
+        return -1;
+    }
+    l3track_default_params(&gTrackParams);
+    gTrackLoopPeriodS = values[0];
+    gTrackRangeResM = values[1];
+    gTrackParams.maxRangeM = values[2];
+    gTrackParams.clubGate.loM = values[3];
+    gTrackParams.clubGate.hiM = values[4];
+    gTrackConfigured = 1U;
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* Longest triggerCfg waits for the detect task to finish scoring a frame. */
+#define L3_TRIGGER_CFG_WAIT_MS 50U
+
+/* CLI "triggerCfg <bin> <snr> <on> [approach past stat]": turn the
+ * self-trigger's detect path on around the destination bin, a GLOBAL
+ * range-FFT bin (the host converts the tee range; bin 34 is 1.59 m on a
+ * 128-point FFT over 6 m). Club targets need a residual statistic of at least
+ * <snr> times the running noise floor. <on> of 0 turns the self-trigger off;
+ * any other value turns it on (it was the removed range gate's track-frame
+ * count, so existing arming lines still work). The club track's range-only
+ * impact fires the capture. The optional values are the bins watched short
+ * of the destination, the bins past it, and the statistic (0 = energy over
+ * all loops, 1 = strongest loop). The range gate's own thresholds went with
+ * it, so a longer line is refused rather than half applied. */
+static int32_t l3_cli_triggerCfg(int32_t argc, char *argv[])
+{
+    l3_trig_cfg_t cfg;
+    unsigned long value;
+    unsigned long on;
+    char *end;
+
+    if (argc < 4 || argc > 7) {
+        CLI_write("Error: triggerCfg <globalBin> <snr> <on> [approach past stat]\n");
+        return -1;
+    }
+    l3_trig_cfg_defaults(&cfg);
+    value = strtoul(argv[1], &end, 10);
+    if (*end != '\0') {
+        CLI_write("Error: trigger bin\n");
+        return -1;
+    }
+    cfg.teeBin = (uint32_t)value;
+    cfg.snr = strtof(argv[2], &end);
+    if (*end != '\0') {
+        CLI_write("Error: trigger snr\n");
+        return -1;
+    }
+    on = strtoul(argv[3], &end, 10);
+    if (*end != '\0') {
+        CLI_write("Error: trigger on\n");
+        return -1;
+    }
+    if (argc > 4) {
+        value = strtoul(argv[4], &end, 10);
+        if (*end != '\0') {
+            CLI_write("Error: trigger approach bins\n");
+            return -1;
+        }
+        cfg.approachBins = (uint32_t)value;
+    }
+    if (argc > 5) {
+        value = strtoul(argv[5], &end, 10);
+        if (*end != '\0') {
+            CLI_write("Error: trigger past bins\n");
+            return -1;
+        }
+        cfg.pastBins = (uint32_t)value;
+    }
+    if (argc > 6) {
+        value = strtoul(argv[6], &end, 10);
+        if (*end != '\0') {
+            CLI_write("Error: trigger stat\n");
+            return -1;
+        }
+        cfg.stat = (uint32_t)value;
+    }
+    if (on != 0UL && l3_trig_cfg_check(&cfg) != 0) {
+        CLI_write("Error: trigger config (snr >= 1, past < approach <= %u, stat 0|1)\n",
+                  (unsigned)L3_TRIG_MAX_BINS);
+        return -1;
+    }
+    /* Stop the detector, let a frame already being scored finish (the CLI
+     * task outranks the detect task, so sleep rather than spin), then reset.
+     * Scoring takes well under a frame; the bound only guards a stalled
+     * detect task from wedging the CLI. */
+    gTriggerEnabled = 0U;
+    {
+        uint32_t waited = 0U;
+        while (gTrigBusy && waited < L3_TRIGGER_CFG_WAIT_MS) {
+            Task_sleep(1);
+            waited++;
+        }
+    }
+    gTrigCfg = cfg;
+    l3_trig_init(&gTrig, &gTrigCfg);
+    l3_clubTrackConfigure();
+    gTriggerEnabled = (on != 0UL) ? 1U : 0U;
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "triggerLog trace": what the detector was offered. A header, the per-bin
+ * maximum of the detection statistic since arming (eight bins per line, each
+ * "bin:max@frame"), then one line per traced frame, oldest first: the
+ * region's strongest bin whenever it reached the trace bar, with its
+ * all-loop energy, strongest-loop power, loop-0 power and the floor. A swing
+ * the club track never took still shows up here, or shows up nowhere, which
+ * says whether the club is invisible or merely under the threshold. */
+static void l3_writeTriggerTrace(char *line, uint32_t cap)
+{
+    l3_trig_trace_t entry;
+    uint32_t count;
+    uint32_t index;
+
+    (void)l3_trig_format_trace_header(&gTrig, line, cap);
+    CLI_write("%s\n", line);
+    for (index = 0U; index < gTrig.maxBins; index += 8U) {
+        (void)l3_trig_format_maxhold(&gTrig, index, 8U, line, cap);
+        CLI_write("%s\n", line);
+    }
+    count = l3_trig_trace_count(&gTrig);
+    for (index = 0U; index < count; index++) {
+        if (!l3_trig_trace_get(&gTrig, index, &entry)) {
+            break;
+        }
+        (void)l3_trig_format_trace(&entry, line, cap);
+        CLI_write("%s\n", line);
+    }
+}
+
+/* The detect core's line, the timing summary and each timing statistic;
+ * with timeline, every kept frame's timeline, oldest first. line is the
+ * caller's (static) buffer, wide enough for the timing lines (~170); the
+ * detect line has its own. */
+static void l3_writeDetectTiming(char *line, uint32_t cap, uint8_t timeline)
+{
+    static char detect[L3_DETECT_LINE_BYTES] L3_HSRAM_DIAG;
+    uint32_t index;
+
+    l3_detectCoreEnsure();
+    (void)l3_detect_core_format(&gDetectCore, L3_DSS_CLOCK_MHZ, detect, sizeof(detect));
+    CLI_write("%s\n", detect);
+    if (!gTimingReady) {
+        CLI_write("timing frames=0 (no frame decided yet)\n");
+        return;
+    }
+    (void)l3_timing_format_summary(&gTiming, line, cap);
+    CLI_write("%s\n", line);
+    for (index = 0U; index < L3_TIMING_STAT_COUNT; index++) {
+        (void)l3_timing_format_stat(&gTiming, index, line, cap);
+        CLI_write("%s\n", line);
+    }
+    if (timeline) {
+        l3_timing_event_t event;
+
+        for (index = 0U; l3_timing_event(&gTiming, index, &event) == 0; index++) {
+            (void)l3_timing_format_event(&gTiming, &event, line, cap);
+            CLI_write("%s\n", line);
+        }
+    }
+}
+
+/* CLI "triggerLog [trace|track|shot|result|perf|timing|clear]". Bare: the
+ * self-trigger front end's floor and threshold, then its configuration.
+ * "track" prints the club track that fires; "trace" the raw-input trace
+ * (see above); "clear" empties the trace and its maxima without touching
+ * the arm. */
+static int32_t l3_cli_triggerLog(int32_t argc, char *argv[])
+{
+    /* Static, not on the CLI task's small stack. Must hold at least
+     * L3_RESULT_PACKET_BYTES + 1 for the "result" packet's first half. */
+    static char line[192] L3_HSRAM_DIAG;
+    uint32_t index;
+
+    if (argc == 2 && strcmp(argv[1], "clear") == 0) {
+        l3_trig_trace_clear(&gTrig);
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "trace") == 0) {
+        l3_writeTriggerTrace(line, sizeof(line));
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "cal") == 0) {
+        /* The calibration in force: offsets, attitude, range bias, then
+         * every element's gain and phase (physical order). */
+        l3_ensureRadarCal();
+        (void)l3_cal_format(&gRadarCal, line, sizeof(line));
+        CLI_write("%s\n", line);
+        for (index = 0U; index < gRadarCal.virtualElements && index < L3_CAL_MAX_VIRTUAL; index++) {
+            (void)l3_cal_format_element(&gRadarCal, index, line, sizeof(line));
+            CLI_write("%s\n", line);
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+#ifdef L3_RING_IQ8
+    if (argc == 2 && strcmp(argv[1], "frames") == 0) {
+        /* What each stored slot of the compact ring holds: pre slots oldest
+         * first, then the post slots. */
+        uint32_t actualPre = (gPreFramesCaptured < gCapturePlan.preFrames)
+                                 ? gPreFramesCaptured : gCapturePlan.preFrames;
+        uint32_t oldestPre = (gPreFramesCaptured >= gCapturePlan.preFrames)
+                                 ? (gPreFramesCaptured % gCapturePlan.preFrames) : 0U;
+
+        if (!l3_captureCompactsIq16()) {
+            CLI_write("frames: not a compact format\n");
+            CLI_write("Done\n");
+            return 0;
+        }
+        for (index = 0U; index < actualPre; index++) {
+            uint32_t slot = (oldestPre + index) % gCapturePlan.preFrames;
+
+            (void)l3_frame_desc_format(&gFrameDesc[slot], line, sizeof(line));
+            CLI_write("slot %u %s\n", (unsigned)slot, line);
+        }
+        for (index = 0U; index < gPostFramesCaptured && index < gCapturePlan.postFrames; index++) {
+            uint32_t slot = gCapturePlan.preFrames + index;
+
+            (void)l3_frame_desc_format(&gFrameDesc[slot], line, sizeof(line));
+            CLI_write("slot %u %s\n", (unsigned)slot, line);
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+#endif
+    if (argc == 2 && strcmp(argv[1], "perf") == 0) {
+        /* Per-stage cost in microseconds, then the adaptive window state. */
+        if (gProfileReady) {
+            (void)l3_profile_format_summary(&gProfile, line, sizeof(line));
+            CLI_write("%s\n", line);
+            for (index = 0U; index < L3_PROF_STAGE_COUNT; index++) {
+                (void)l3_profile_format(&gProfile, index, line, sizeof(line));
+                CLI_write("%s\n", line);
+            }
+        } else {
+            CLI_write("perf frames=0 (no frame scored yet)\n");
+        }
+        CLI_write("angles queued=%u done=%u stale=%u failed=%u dropped=%u pending=%u\n",
+                  (unsigned)gAngleQueue.queued, (unsigned)gAngleQueue.done,
+                  (unsigned)gAngleQueue.stale, (unsigned)gAngleQueue.failed,
+                  (unsigned)gAngleQueue.dropped,
+                  (unsigned)l3_angle_queue_pending(&gAngleQueue));
+        (void)l3_adaptive_format(&gAdaptiveCfg, &gAdaptiveWindows, line, sizeof(line));
+        CLI_write("%s applied=%u\n", line, (unsigned)gAdaptiveApplied);
+        l3_writeDetectTiming(line, sizeof(line), 0U);
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "timing") == 0) {
+        /* The detect core and the timing, then the last frames' timelines. */
+        l3_writeDetectTiming(line, sizeof(line), 1U);
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "result") == 0) {
+        /* The shot result: verdict and quality, every metric with its
+         * confidence and flags, then the packet as hex. Readable before
+         * RESULT too: it is then the last shot's, or all invalid. */
+        (void)l3_result_format(&gShotResult, line, sizeof(line));
+        CLI_write("%s ready=%u\n", line, (unsigned)gShotResultReady);
+        for (index = 0U; index < L3_RESULT_METRICS; index++) {
+            (void)l3_result_format_metric(&gShotResult, index, line, sizeof(line));
+            CLI_write("%s\n", line);
+        }
+        {
+            /* 328 hex characters is longer than a CLI line; two halves. */
+            static char hex[L3_RESULT_PACKET_BYTES * 2U + 1U];
+
+            (void)l3_result_format_hex(&gShotResult, hex, sizeof(hex));
+            memcpy(line, hex, L3_RESULT_PACKET_BYTES);
+            line[L3_RESULT_PACKET_BYTES] = '\0';
+            CLI_write("packet %s\n", line);
+            CLI_write("packet+ %s\n", &hex[L3_RESULT_PACKET_BYTES]);
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "shot") == 0) {
+        /* The shot machine, the ball tracker, the launch and its points. */
+        l3_track_point_t point;
+
+        (void)l3_shot_format(&gShot, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_ball_track_format_status(&gBallTrack, line, sizeof(line));
+        CLI_write("%s post=%u\n", line, (unsigned)gPostFramesScored);
+        (void)l3_launch_format(&gLaunch, line, sizeof(line));
+        CLI_write("%s\n", line);
+        for (index = 0U; l3_track_point(&gBallTrack.core, index, &point); index++) {
+            (void)l3_track_format_point(&point, (uint32_t)gBallTrack.originBin, line,
+                                        sizeof(line));
+            CLI_write("%s\n", line);
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "track") == 0) {
+        /* The club track: status with the fitted speed, then every held
+         * point oldest first, distances in bins short of the destination. */
+        l3_track_point_t point;
+        (void)l3_track_format_status(&gClubTrack, gClubTrackDest, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_track_format_delivery(&gDelivery, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_angle_format(&gLastAngle, line, sizeof(line));
+        CLI_write(" %s estimates=%u\n", line, (unsigned)gAngleEstimates);
+        (void)l3_impact_format(&gRangeImpact, line, sizeof(line));
+        CLI_write("range %s\n", line);
+        (void)l3_leave_format(&gLeave, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_impact_fit_format(&gImpactFit, line, sizeof(line));
+        CLI_write("%s\n", line);
+        for (index = 0U; l3_track_point(&gClubTrack, index, &point); index++) {
+            (void)l3_track_format_point(&point, gClubTrackDest, line, sizeof(line));
+            CLI_write("%s\n", line);
+        }
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc != 1) {
+        CLI_write("Error: triggerLog [trace|track|shot|result|perf|timing|frames|cal|clear]\n");
+        return -1;
+    }
+    /* The front end's floor and arming; "track" has the club track, which
+     * fires, and "trace" what the radar was offered. */
+    (void)l3_trig_format_summary(&gTrig, line, sizeof(line));
+    CLI_write("%s\n", line);
+    (void)l3_trig_format_config(&gTrig, line, sizeof(line));
+    CLI_write("%s\n", line);
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* CLI "debugCfg <0|1>": stream one trig line per detection frame. */
+static int32_t l3_cli_debugCfg(int32_t argc, char *argv[])
+{
+    unsigned long enabled;
+    char *end;
+
+    if (argc != 2) {
+        CLI_write("Error: debugCfg <0|1>\n");
+        return -1;
+    }
+    enabled = strtoul(argv[1], &end, 10);
+    if (*end != '\0' || enabled > 1UL) {
+        CLI_write("Error: debugCfg <0|1>\n");
+        return -1;
+    }
+    gTriggerDebug = (uint8_t)enabled;
+    if (!gTriggerDebug) {
+        gTriggerDebugPhase = 0xFFU;
+    } else {
+        /* Static, not on the CLI task's small stack. */
+        static char line[L3_NOTICE_LINE_BYTES];
+        if (l3_formatTriggerDebug(gTriggerPhase, line, sizeof(line))) {
+            CLI_write("%s", line);
+        }
+    }
+    CLI_write("Done\n");
+    return 0;
+}
+
+/* "ball scan <firstBin> <count>": freeze at the next frame boundary, report
+ * the static power of <count> GLOBAL bins from <firstBin>, averaged over
+ * every pre-trigger frame in the ring, then rearm. Values are the mean
+ * |I + jQ|^2 per complex sample (vertical TX pair, all RX, all loops), so
+ * scans of different depths compare directly; the host averages repeated
+ * scans for a longer baseline. Bins outside a frame's window read 0. */
+static int32_t l3_ballScan(uint32_t first, uint32_t count)
+{
+    static float power[L3_RING_MAX_BINS];
+    l3_sparse_window_t window;
+    uint32_t bin;
+    uint32_t frame;
+    uint32_t preFrames = 0U;
+
+    if (l3_sparseFreeze() != 0) {
+        return -1;
+    }
+    l3_sparseWindow(&window);
+    for (bin = 0U; bin < count; bin++) {
+        power[bin] = 0.0F;
+    }
+    /* Pre-trigger slots only: post slots may hold another window. */
+    for (frame = 0U; frame < window.nFrames; frame++) {
+        uint32_t windowStart = window.starts[frame];
+        if (window.slots[frame] >= gCapturePlan.preFrames) {
+            continue;
+        }
+        preFrames++;
+        for (bin = 0U; bin < count; bin++) {
+            uint32_t global = first + bin;
+            if (global >= windowStart && global - windowStart < window.counts[frame]) {
+                l3_detect_frame_t ringFrame = l3_ringFrameOf(window.slots[frame]);
+
+                power[bin] += l3_verticalStaticPower(&ringFrame, global - windowStart, 1U);
+            }
+        }
+    }
+    CLI_write("teescan frames=%u loops=%u first=%u count=%u start=%u\n",
+              (unsigned)preFrames, (unsigned)gCapturePlan.loops,
+              (unsigned)first, (unsigned)count,
+              (unsigned)(window.nFrames ? window.starts[0] : 0U));
+    for (bin = 0U; bin < count; bin++) {
+        float mean = (preFrames > 0U) ? (power[bin] / (float)preFrames) : 0.0F;
+        if (mean > 4.0e9F) {
+            mean = 4.0e9F;
+        }
+        CLI_write("bin=%u power=%u\n", (unsigned)(first + bin), (unsigned)mean);
+    }
+    return l3_sparseRearm();
+}
+
+/* CLI "ball [status] | ball scan <firstBin> <count> | ball cfg <enable>
+ * <follow> [minRatio stableUpdates buildUpdates]": the ball-placement
+ * detector. "cfg" (re)starts it: enable 0 turns it off; follow 1 makes the
+ * self-trigger track the club toward the locked ball's bin instead of the
+ * configured tee, falling back to the tee (counted in stats) while no ball
+ * is locked. "status" (or no argument) prints the state line that stats
+ * also carries, then a balldbg line with centroid, width, persistence and
+ * the reasons acquisition did not lock. */
+static int32_t l3_cli_ball(int32_t argc, char *argv[])
+{
+    static char line[192] L3_HSRAM_DIAG;
+
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
+        (void)l3_ball_format_status(&gBall, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_ball_format_debug(&gBall, line, sizeof(line));
+        CLI_write("%s\n", line);
+        (void)l3_angle_format(&gBallAngle, line, sizeof(line));
+        CLI_write("ball%s valid=%u\n", line + 5, (unsigned)gBallAngleValid); /* "ballangle ..." */
+        CLI_write("Done\n");
+        return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "scan") == 0) {
+        unsigned long first;
+        unsigned long count;
+        char *end;
+
+        first = strtoul(argv[2], &end, 10);
+        if (*end != '\0' || first >= 2U * L3_RING_MAX_BINS) {
+            CLI_write("Error: ball scan first bin\n");
+            return -1;
+        }
+        count = strtoul(argv[3], &end, 10);
+        if (*end != '\0' || count == 0UL || count > L3_RING_MAX_BINS) {
+            CLI_write("Error: ball scan count\n");
+            return -1;
+        }
+        return l3_ballScan((uint32_t)first, (uint32_t)count);
+    }
+    if (argc >= 4 && argc <= 7 && strcmp(argv[1], "cfg") == 0) {
+        l3_ball_cfg_t cfg;
+        unsigned long value;
+        char *end;
+        uint32_t waited = 0U;
+
+        l3_ball_cfg_defaults_at(&cfg, L3_BALL_FRAMES_PER_UPDATE);
+        value = strtoul(argv[2], &end, 10);
+        if (*end != '\0' || value > 1UL) {
+            CLI_write("Error: ball cfg enable\n");
+            return -1;
+        }
+        cfg.enabled = (uint8_t)value;
+        value = strtoul(argv[3], &end, 10);
+        if (*end != '\0' || value > 1UL) {
+            CLI_write("Error: ball cfg follow\n");
+            return -1;
+        }
+        cfg.follow = (uint8_t)value;
+        if (argc > 4) {
+            cfg.minRatio = strtof(argv[4], &end);
+            if (*end != '\0') {
+                CLI_write("Error: ball cfg min ratio\n");
+                return -1;
+            }
+        }
+        if (argc > 5) {
+            value = strtoul(argv[5], &end, 10);
+            if (*end != '\0') {
+                CLI_write("Error: ball cfg stable updates\n");
+                return -1;
+            }
+            cfg.stableUpdates = (uint32_t)value;
+        }
+        if (argc > 6) {
+            value = strtoul(argv[6], &end, 10);
+            if (*end != '\0') {
+                CLI_write("Error: ball cfg build updates\n");
+                return -1;
+            }
+            cfg.buildUpdates = (uint32_t)value;
+        }
+        if (cfg.enabled && l3_ball_cfg_check(&cfg) != 0) {
+            CLI_write("Error: ball cfg (minRatio > 0, counts > 0)\n");
+            return -1;
+        }
+        if (cfg.follow && !cfg.enabled) {
+            CLI_write("Error: ball cfg follow needs enable\n");
+            return -1;
+        }
+        /* Let a frame being scored finish, as triggerCfg does. */
+        while (gBallBusy && waited < L3_TRIGGER_CFG_WAIT_MS) {
+            Task_sleep(1);
+            waited++;
+        }
+        gBallCfg = cfg;
+        l3_ball_init(&gBall, &gBallCfg);
+        memset(&gBallAngleClock, 0, sizeof(gBallAngleClock));
+        gTrigDestBall = 0U;
+        gTrigFallbackFrames = 0U;
+        CLI_write("Done\n");
+        return 0;
+    }
+    CLI_write("Error: ball [status] | ball scan <firstBin> <count> | "
+              "ball cfg <enable> <follow> [minRatio stable build]\n");
+    return -1;
+}
+
+/* "stats version": identify the flashed image. One line of space-separated
+ * key=value pairs; the host parses it, so keep keys stable. A sub-mode of
+ * "stats" because the CLI table is at the SDK's CLI_MAX_CMD. Images that
+ * predate it ignore the argument and print the counters instead. */
+static int32_t l3_statsVersion(void)
+{
+    CLI_write("version=%s git=%s variant=%s built=%s\n",
+              L3_FW_VERSION, L3_FW_GIT, L3_FW_VARIANT, L3_FW_BUILT);
+    return 0;
+}
+
+/* CLI "stats [version]": report capture counters (diagnostic), or with
+ * "version" the image identity. */
 static int32_t l3_cli_stats(int32_t argc, char *argv[])
 {
-    (void)argc; (void)argv;
-#ifdef LIVE_SNAPSHOT_RING
-    CLI_write("frames=%u wraps=%u active=%d calib=0x%x rf_faults=%u "
-              "snap_frames=%u snap_ready=0x%x snap_drops=%u snap_err=%u snap_busy=%u\n",
-              (unsigned)gNumFrame, (unsigned)gNumWrap, (int)gCaptureActive,
-              (unsigned)gCalibStatus, (unsigned)gRfFaults,
-              (unsigned)gSnapshotFrames, (unsigned)gRawFrameReadyMask,
-              (unsigned)gRawFrameDrops, (unsigned)gSnapshotErrors,
-              (unsigned)gSnapshotBusy);
-#else
+    if (argc == 2 && strcmp(argv[1], "version") == 0) {
+        return l3_statsVersion();
+    }
+    if (argc != 1) {
+        CLI_write("Error: stats [version]\n");
+        return -1;
+    }
 #ifdef HWA_CHAINED_SNAPSHOT_RING
-#ifdef CONFIGURABLE_CAPTURE
 #ifdef L3_RING_IQ8
     CLI_write("frames=%u wraps=%u active=%d calib=0x%x rf_faults=%u "
               "hwa_frames=%u hwa_out=%u hwa_rearms=%u hwa_rearm_err=%u "
@@ -2661,7 +5821,7 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[])
               (unsigned)gHwaMissedFrameStarts,
               (unsigned)gHwaFreezeRequests, (unsigned)gHwaFreezeCompletions,
               (unsigned)gHwaFreezeTimeouts,
-              l3_captureUsesIq8() ? "iq8" : "iq16",
+              l3_captureFormatName(),
               (unsigned)gCapturePlan.preFrames,
               (unsigned)gCapturePlan.postFrames,
               (unsigned)gCapturePlan.loops,
@@ -2718,25 +5878,47 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[])
               (unsigned)gCapturePlan.postStride);
 #endif
 #else
-    CLI_write("frames=%u wraps=%u active=%d calib=0x%x rf_faults=%u "
-              "hwa_frames=%u hwa_out=%u hwa_rearms=%u hwa_rearm_err=%u "
-              "hwa_missed=%u hwa_wait=0x%x freeze_req=%u freeze_done=%u freeze_to=%u "
-              "freeze_restart=%u\n",
-              (unsigned)gNumFrame, (unsigned)gNumWrap, (int)gCaptureActive,
-              (unsigned)gCalibStatus, (unsigned)gRfFaults,
-              (unsigned)gHwaFrameDone, (unsigned)gHwaOutputDone,
-              (unsigned)gHwaRearms, (unsigned)gHwaRearmErrors,
-              (unsigned)gHwaMissedFrameStarts,
-              (unsigned)((gHwaDoneSeen ? 1U : 0U) |
-                         (gHwaOutputSeen ? 2U : 0U)),
-              (unsigned)gHwaFreezeRequests, (unsigned)gHwaFreezeCompletions,
-              (unsigned)gHwaFreezeTimeouts, (unsigned)gHwaFreezeRestarts);
-#endif
-#else
     CLI_write("frames=%u wraps=%u active=%d calib=0x%x rf_faults=%u\n",
               (unsigned)gNumFrame, (unsigned)gNumWrap, (int)gCaptureActive,
               (unsigned)gCalibStatus, (unsigned)gRfFaults);
 #endif
+    {
+        static char ballLine[192] L3_HSRAM_DIAG;
+        (void)l3_ball_format_status(&gBall, ballLine, sizeof(ballLine));
+        CLI_write("%s\n", ballLine);
+    }
+    CLI_write("trig dest=%u source=%s fallback=%u\n",
+              (unsigned)(gTrigDestBall ? gBall.ballBin : gTrigCfg.teeBin),
+              gTrigDestBall ? "ball" : "tee", (unsigned)gTrigFallbackFrames);
+    CLI_write("trig phase=%s tee=%u latched=%u enabled=%u\n",
+              l3_triggerPhaseName(gTriggerPhase),
+              (unsigned)gTriggerTeePower,
+              (unsigned)gSelfTriggerLatched,
+              (unsigned)gTriggerEnabled);
+#ifdef HWA_CHAINED_SNAPSHOT_RING
+    CLI_write("detect dropped=%u stale=%u notice_dropped=%u shed=%u stale_read=%u\n",
+              (unsigned)gDetectQueue.dropped,
+              (unsigned)gDetectStale,
+              (unsigned)gNoticeDropped,
+              (unsigned)gDetectShed,
+              (unsigned)gDetectStaleAfterRead);
+#ifdef L3_RING_IQ8
+    if (l3_captureCompactsIq16()) {
+        static char retainLine[96];
+
+        (void)l3_retain_format(&gLastRetain, retainLine, sizeof(retainLine));
+        CLI_write("compact frames=%u errors=%u max_us=%u scratch_stale=%u retain=%u/%u/%u %s\n",
+                  (unsigned)gCompactFrames, (unsigned)gCompactErrors,
+                  (unsigned)gCompactMaxUs, (unsigned)gDetectScratchStale,
+                  (unsigned)gCapturePlan.retainPreBins,
+                  (unsigned)gCapturePlan.retainImpactBins,
+                  (unsigned)gCapturePlan.retainPostBins, retainLine);
+    }
+#endif
+    CLI_write("rearm_last_us=%u rearm_max_us=%u rearm_timed=%u\n",
+              (unsigned)gHwaRearmLastUs,
+              (unsigned)gHwaRearmMaxUs,
+              (unsigned)gHwaRearmTimed);
 #endif
     return 0;
 }
@@ -2908,26 +6090,14 @@ static int32_t l3_armCapture(void)
     EDMA_channelConfig_t   ch;
     EDMA_paramSetConfig_t *ps;
     EDMA_paramConfig_t     linkCfg;
-#ifdef LIVE_SNAPSHOT_RING
-    EDMA_paramConfig_t     linkCfgPong;
-#endif
     uint32_t               srcAddr, dstAddr;
 
     srcAddr = SOC_translateAddress(
-#ifdef LIVE_SNAPSHOT_RING
-        SOC_XWR68XX_MSS_ADCBUF_BASE_ADDRESS,
-#else
         SOC_XWR68XX_MSS_ADCBUF_BASE_ADDRESS +
             (SAVE_OFFSET_SAMPLES * 2U * (uint32_t)sizeof(int16_t)),
-#endif
         SOC_TranslateAddr_Dir_TO_EDMA, NULL);
-#ifdef LIVE_SNAPSHOT_RING
-    dstAddr = SOC_translateAddress((uint32_t)&g_rawFrame[0][0],
-                                   SOC_TranslateAddr_Dir_TO_EDMA, NULL);
-#else
     dstAddr = SOC_translateAddress((uint32_t)&g_ring[0][0],
                                    SOC_TranslateAddr_Dir_TO_EDMA, NULL);
-#endif
 
     (void)EDMA_disableChannel(gEdmaHandle, L3_EDMA_CHANNEL, EDMA3_CHANNEL_TYPE_DMA);
 
@@ -2942,18 +6112,6 @@ static int32_t l3_armCapture(void)
     ps = &ch.paramSetConfig;
     ps->sourceAddress      = srcAddr;
     ps->destinationAddress = dstAddr;
-#ifdef LIVE_SNAPSHOT_RING
-    ps->aCount             = (uint16_t)(N_SAMPLES * 2U * sizeof(int16_t));
-    ps->bCount             = (uint16_t)N_RX;
-    ps->cCount             = (uint16_t)CHIRPS_PER_FRAME;
-    ps->bCountReload       = (uint16_t)N_RX;
-    ps->sourceBindex       = (int16_t)(N_SAMPLES * 2U * sizeof(int16_t));
-    ps->destinationBindex  = (int16_t)(N_SAMPLES * 2U * sizeof(int16_t));
-    ps->sourceCindex       = 0;
-    ps->destinationCindex  = (int16_t)CHIRP_BYTES;
-    ps->transferCompletionCode = (uint8_t)L3_EDMA_CHANNEL;
-    ch.transferCompletionCallbackFxnArg = (uintptr_t)0U;
-#else
     ps->aCount             = (uint16_t)(SAVE_SAMPLES * 2U * sizeof(int16_t));
     ps->bCount             = (uint16_t)N_RX;          /* 4 arrays = one chirp per event */
     ps->cCount             = (uint16_t)RING_CHIRPS;   /* events before wrap */
@@ -2963,7 +6121,6 @@ static int32_t l3_armCapture(void)
     ps->sourceCindex       = 0;                       /* re-read ADCBUF base every event */
     ps->destinationCindex  = (int16_t)SAVED_CHIRP_BYTES; /* advance dest one chirp per event */
     ps->transferCompletionCode = (uint8_t)L3_EDMA_CHANNEL;
-#endif
     ps->linkAddress        = EDMA_NULL_LINK_ADDRESS;
     ps->transferType       = (uint8_t)EDMA3_SYNC_AB;
     ps->sourceAddressingMode      = (uint8_t)EDMA3_ADDRESSING_MODE_LINEAR;
@@ -2982,32 +6139,6 @@ static int32_t l3_armCapture(void)
     }
     memcpy((void *)&linkCfg.paramSetConfig, (void *)ps, sizeof(EDMA_paramSetConfig_t));
     linkCfg.transferCompletionCallbackFxn    = l3_edmaCB;
-#ifdef LIVE_SNAPSHOT_RING
-    linkCfg.transferCompletionCallbackFxnArg = (uintptr_t)0U;
-    linkCfg.paramSetConfig.destinationAddress =
-        SOC_translateAddress((uint32_t)&g_rawFrame[0][0],
-                             SOC_TranslateAddr_Dir_TO_EDMA, NULL);
-    memcpy((void *)&linkCfgPong, (void *)&linkCfg, sizeof(linkCfgPong));
-    linkCfgPong.transferCompletionCallbackFxnArg = (uintptr_t)1U;
-    linkCfgPong.paramSetConfig.destinationAddress =
-        SOC_translateAddress((uint32_t)&g_rawFrame[1][0],
-                             SOC_TranslateAddr_Dir_TO_EDMA, NULL);
-    if (EDMA_configParamSet(gEdmaHandle, L3_EDMA_LINK_CHANNEL, &linkCfg) != EDMA_NO_ERROR) {
-        return -1;
-    }
-    if (EDMA_configParamSet(gEdmaHandle, L3_EDMA_LINK_CHANNEL_PONG, &linkCfgPong) != EDMA_NO_ERROR) {
-        return -1;
-    }
-    if (EDMA_linkParamSets(gEdmaHandle, L3_EDMA_CHANNEL, L3_EDMA_LINK_CHANNEL_PONG) != EDMA_NO_ERROR) {
-        return -1;
-    }
-    if (EDMA_linkParamSets(gEdmaHandle, L3_EDMA_LINK_CHANNEL_PONG, L3_EDMA_LINK_CHANNEL) != EDMA_NO_ERROR) {
-        return -1;
-    }
-    if (EDMA_linkParamSets(gEdmaHandle, L3_EDMA_LINK_CHANNEL, L3_EDMA_LINK_CHANNEL_PONG) != EDMA_NO_ERROR) {
-        return -1;
-    }
-#else
     linkCfg.transferCompletionCallbackFxnArg = (uintptr_t)0U;
     if (EDMA_configParamSet(gEdmaHandle, L3_EDMA_LINK_CHANNEL, &linkCfg) != EDMA_NO_ERROR) {
         return -1;
@@ -3018,7 +6149,6 @@ static int32_t l3_armCapture(void)
     if (EDMA_linkParamSets(gEdmaHandle, L3_EDMA_LINK_CHANNEL, L3_EDMA_LINK_CHANNEL) != EDMA_NO_ERROR) {
         return -1;
     }
-#endif
     /* Arm the channel to respond to the hardware event. */
     if (EDMA_enableChannel(gEdmaHandle, L3_EDMA_CHANNEL, EDMA3_CHANNEL_TYPE_DMA) != EDMA_NO_ERROR) {
         return -1;
@@ -3051,60 +6181,6 @@ static int32_t l3_mmwaveEvent(uint16_t msgId, uint16_t sbId, uint16_t sbLen,
     return 0;
 }
 
-#ifdef LIVE_SNAPSHOT_RING
-static void l3_snapshotTask(UArg arg0, UArg arg1)
-{
-    (void)arg0; (void)arg1;
-
-    while (1) {
-        uintptr_t key;
-        uint32_t  mask;
-        uint32_t  slot;
-        uint32_t  chirp;
-        uint32_t  ringSlot;
-        int32_t   err = 0;
-
-        key = Hwi_disable();
-        mask = gRawFrameReadyMask;
-        if ((mask & 0x1U) != 0U) {
-            slot = 0U;
-            gRawFrameReadyMask &= ~0x1U;
-        } else if ((mask & 0x2U) != 0U) {
-            slot = 1U;
-            gRawFrameReadyMask &= ~0x2U;
-        } else {
-            Hwi_restore(key);
-            Task_sleep(1);
-            continue;
-        }
-        Hwi_restore(key);
-
-        gSnapshotBusy = 1U;
-        ringSlot = gSnapshotFrames % RING_FRAMES;
-        for (chirp = 0U; chirp < CHIRPS_PER_FRAME; chirp++) {
-            const int16_t *rawChirp =
-                &g_rawFrame[slot][chirp * N_RX * N_SAMPLES * 2U];
-            int16_t *snapshotChirp =
-                &g_ring[ringSlot][chirp * SNAPSHOT_CHIRP_COMPLEX * 2U];
-            err = l3_snapshotChirpToBuffer(rawChirp, snapshotChirp);
-            if (err != 0) {
-                break;
-            }
-        }
-        if (err == 0) {
-            gSnapshotFrames++;
-            gRingFrame = gSnapshotFrames;
-            if ((gSnapshotFrames >= RING_FRAMES) &&
-                ((gSnapshotFrames % RING_FRAMES) == 0U)) {
-                gNumWrap++;
-            }
-        } else {
-            gSnapshotErrors++;
-        }
-        gSnapshotBusy = 0U;
-    }
-}
-#endif
 
 /* mmWave control execution context (must outrank the CLI task). */
 static void l3_mmwaveCtrlTask(UArg arg0, UArg arg1)
@@ -3163,28 +6239,21 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
             (MMWave_getProfileCfg(gCtrlCfg.u.frameCfg.profileHandle[0],
                                   &profCfg, &errCode) < 0) ||
             (profCfg.numAdcSamples != N_SAMPLES) ||
-#ifndef CONFIGURABLE_CAPTURE
-            (gCtrlCfg.u.frameCfg.frameCfg.numLoops != LOOPS) ||
-#endif
             (chirpCount != N_TX)) {
-#ifdef CONFIGURABLE_CAPTURE
             CLI_write("Error: cfg geometry mismatch -- this firmware needs "
                       "%d TX x %d samples\n", N_TX, N_SAMPLES);
-#else
-            CLI_write("Error: cfg geometry mismatch — this firmware is built "
-                      "for %d TX x %d samples x %d loops\n",
-                      N_TX, N_SAMPLES, LOOPS);
-#endif
             return -1;
         }
         /* framePeriodicity LSB = 5 ns -> microseconds. */
         gFramePeriodUs =
             (uint16_t)(gCtrlCfg.u.frameCfg.frameCfg.framePeriodicity / 200U);
-#ifdef CONFIGURABLE_CAPTURE
+        /* One loop is one chirp per TX; idle and ramp are in 10 ns units.
+         * The trigger's Doppler readout is aliased at +/- lambda / (4 T). */
+        gTrigLoopPeriodS = (float)(profCfg.idleTimeConst + profCfg.rampEndTime) *
+                           1.0e-8F * (float)chirpCount;
         if (l3_finalizeCapturePlan(gCtrlCfg.u.frameCfg.frameCfg.numLoops) != 0) {
             return -1;
         }
-#endif
     }
     if (MMWave_config(gMMWaveHandle, &gCtrlCfg, &errCode) < 0) {
         MMWave_decodeError(errCode, &errorLevel, &mmwErr, &subErr);
@@ -3199,19 +6268,16 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
     gNumFrame  = 0U;
     gRingFrame = 0U;
     gNumWrap   = 0U;
-#ifdef LIVE_SNAPSHOT_RING
-    gRawFrameReadyMask = 0U;
-    gRawFrameDrops     = 0U;
-    gSnapshotFrames    = 0U;
-    gSnapshotErrors    = 0U;
-    gSnapshotBusy      = 0U;
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
     gHwaFrameDone      = 0U;
     gHwaOutputDone     = 0U;
     gHwaRearms         = 0U;
     gHwaRearmErrors    = 0U;
     gHwaMissedFrameStarts = 0U;
+    gHwaRearmQueuedValid = 0U;
+    gHwaRearmLastUs    = 0U;
+    gHwaRearmMaxUs     = 0U;
+    gHwaRearmTimed     = 0U;
     gHwaArmedForFrame  = 0U;
     gHwaDoneSeen       = 0U;
     gHwaOutputSeen     = 0U;
@@ -3220,27 +6286,51 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
     gHwaFreezeRequested = 0U;
     gHwaShutdownRequested = 0U;
     gHwaFreezeRequestFrame = 0U;
-    gHwaFreezeTargetFrame = 0U;
     gHwaFreezeRequests = 0U;
     gHwaFreezeCompletions = 0U;
     gHwaFreezeTimeouts = 0U;
     gHwaFreezeRestarts = 0U;
-#ifdef CONFIGURABLE_CAPTURE
     gPreFramesCaptured = 0U;
+    l3_trigRearm();
     gPostFramesCaptured = 0U;
     gPostFramesObserved = 0U;
     gPostCaptureStarted = 0U;
     gActiveFrameIsPost = 0U;
     gActiveFrameShouldKeep = 1U;
+    l3_resetDetectQueue();
+    l3_timingRestart();
+    /* A new session starts untriggered: a latch or enable left by a host that
+     * died mid-shot must not freeze or self-trigger this one. triggerCfg
+     * re-enables it. */
+    gSelfTriggerLatched = 0U;
+    gTriggerEnabled = 0U;
+    gTriggerPhase = 0U;
+    gTriggerTeePower = 0U;
+    gTriggerDebugPhase = 0xFFU;
 #ifdef L3_RING_IQ8
     gIq8Pending = 0U;
+    gIq8PendingDetect = 0U;
+    gIq8PendingEpoch = 0U;
     gIq8PendingSlot = 0U;
     gIq8PendingScratch = 0U;
     gIq8ActiveScratch = 0U;
     gIq8PackFrames = 0U;
     gIq8PackOverruns = 0U;
     gIq8ClippedComponents = 0U;
+    gScratchFrame[0] = 0U;
+    gScratchFrame[1] = 0U;
+    gScratchBusy[0] = 0U;
+    gScratchBusy[1] = 0U;
+    gDetectScratchStale = 0U;
+    gCompactFrames = 0U;
+    gCompactErrors = 0U;
+    gCompactMaxUs = 0U;
+    memset(gFrameScratch, L3_SCRATCH_NONE, sizeof(gFrameScratch));
+    memset(&gLastRetain, 0, sizeof(gLastRetain));
+    memset(gFrameDesc, 0, sizeof(gFrameDesc));
 #ifdef L3_IQ8_EDMA_PACK
+    gIq8PackDetectArm[0] = 0U;
+    gIq8PackDetectArm[1] = 0U;
     gIq8EdmaBusy[0] = 0U;
     gIq8EdmaBusy[1] = 0U;
     gIq8EdmaDone = 0U;
@@ -3251,7 +6341,6 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
     }
 #endif
     memset((void *)gFrameIq8Scale, 0, sizeof(gFrameIq8Scale));
-#endif
 #endif
 #endif
     if (l3_armCapture() < 0) {
@@ -3270,14 +6359,30 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
 
 static int32_t l3_cli_sensorStop(int32_t argc, char *argv[])
 {
+    int32_t status = 0;
+    int32_t errCode;
     (void)argc; (void)argv;
-    if (!gCaptureActive) {
-        return 0;
+
+    if (gSelfTriggerLatched) {
+        /* A self-trigger froze the ring and nobody read it. The freeze
+         * already cleared gCaptureActive, but the BSS is still chirping;
+         * closing over it wedged the CLI ("did not acknowledge sensorStop").
+         * Take the freeze like l3release does, stopping the front end. */
+        status = l3_awaitFrozenRing();
+    } else if (gCaptureActive) {
+        status = l3_stopCaptureForShutdown();
     }
-#ifdef LIVE_SNAPSHOT_RING
-    gRawFrameReadyMask = 0U;
-#endif
-    return l3_stopCaptureForShutdown();
+    /* MMWave_config is refused while the BSS still holds the last profile
+     * (-3110 subsys 83). Closing here lets the next sensorStart reopen and
+     * configure again without a power cycle. */
+    if (gSensorOpened) {
+        if (MMWave_close(gMMWaveHandle, &errCode) < 0) {
+            CLI_write("Error: MMWave_close failed (%d)\n", errCode);
+            return -1;
+        }
+        gSensorOpened = 0U;
+    }
+    return status;
 }
 
 /* System init task: UART, mmWave control, EDMA + ADCBUF + frame-start ISR, CLI. */
@@ -3297,6 +6402,15 @@ static void l3_initTask(UArg arg0, UArg arg1)
 
     (void)arg0; (void)arg1;
 
+    /* HS-RAM is not zeroed at load like .bss, and triggerLog perf may format
+     * these before their lazy init. */
+    memset(&gProfile, 0, sizeof(gProfile));
+    memset(&gTiming, 0, sizeof(gTiming));
+    /* The angle scan's steering rotors, before any task can estimate. */
+    l3_angle_tables_init();
+
+    /* Starts the R4F PMU cycle counter behind Cycleprofiler_getTimeStamp. */
+    Cycleprofiler_init();
     UART_init();
     Pinmux_Set_FuncSel(SOC_XWR68XX_PINN5_PADBE, SOC_XWR68XX_PINN5_PADBE_MSS_UARTA_TX);
     Pinmux_Set_OverrideCtrl(SOC_XWR68XX_PINN5_PADBE,
@@ -3321,6 +6435,12 @@ static void l3_initTask(UArg arg0, UArg arg1)
     uartParams.writeDataMode  = UART_DATA_BINARY;
     uartParams.baudRate       = 1041667;
     uartParams.isPinMuxDone    = 1;
+    /* No echo: the driver echoes from inside its RX interrupt, spinning on
+     * TX-free between bytes. A host cell line arrives back to back at wire
+     * rate, and the one-byte SCI receiver overruns while the ISR waits to
+     * echo. Nothing on the host reads the echo; it syncs on Done/Error and
+     * the packet magics. */
+    uartParams.readEcho       = UART_ECHO_OFF;
     gCliUart = UART_open(0, &uartParams);
 
     UART_Params_init(&uartParams);
@@ -3376,6 +6496,9 @@ static void l3_initTask(UArg arg0, UArg arg1)
 
     /* mmWave control (FULL, ISOLATION). */
     Mailbox_init(MAILBOX_TYPE_MSS);
+    /* The DSS detect link, beside the BSS channel mmWave opens. A DSS that
+     * did not boot leaves it closed; the dsp commands then say so. */
+    l3_dspLinkOpen();
     memset((void *)&initCfg, 0, sizeof(MMWave_InitCfg));
     initCfg.domain                  = MMWave_Domain_MSS;
     initCfg.socHandle               = gSocHandle;
@@ -3403,12 +6526,6 @@ static void l3_initTask(UArg arg0, UArg arg1)
     taskParams.stackSize = 3 * 1024;
     Task_create(l3_mmwaveCtrlTask, &taskParams, NULL);
 
-#ifdef LIVE_SNAPSHOT_RING
-    Task_Params_init(&taskParams);
-    taskParams.priority  = L3_SNAPSHOT_TASK_PRIORITY;
-    taskParams.stackSize = 4 * 1024;
-    Task_create(l3_snapshotTask, &taskParams, NULL);
-#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
     Semaphore_Params_init(&semaphoreParams);
     semaphoreParams.mode = Semaphore_Mode_BINARY;
@@ -3420,7 +6537,7 @@ static void l3_initTask(UArg arg0, UArg arg1)
     if (gHwaFreezeSemaphore == NULL) {
         return;
     }
-#if defined(CONFIGURABLE_CAPTURE) && defined(L3_RING_IQ8) && \
+#if defined(L3_RING_IQ8) && \
     defined(L3_IQ8_EDMA_PACK)
     gIq8EdmaDoneSemaphore = Semaphore_create(0, &semaphoreParams, NULL);
     if (gIq8EdmaDoneSemaphore == NULL) {
@@ -3431,14 +6548,47 @@ static void l3_initTask(UArg arg0, UArg arg1)
     taskParams.priority = L3_HWA_REARM_TASK_PRIORITY;
     taskParams.stackSize = 2U * 1024U;
     Task_create(l3_hwaRearmTask, &taskParams, NULL);
+    semaphoreParams.mode = Semaphore_Mode_COUNTING;
+    gDetectSemaphore = Semaphore_create(0, &semaphoreParams, NULL);
+    if (gDetectSemaphore == NULL) {
+        return;
+    }
+    l3detect_init(&gDetectQueue);
+    Task_Params_init(&taskParams);
+    taskParams.priority = L3_DETECT_TASK_PRIORITY;
+    taskParams.stackSize = 3U * 1024U;
+    Task_create(l3_detectTask, &taskParams, NULL);
+    l3_angle_queue_init(&gAngleQueue);
+    semaphoreParams.mode = Semaphore_Mode_BINARY;
+    gAngleSemaphore = Semaphore_create(0, &semaphoreParams, NULL);
+    semaphoreParams.mode = Semaphore_Mode_COUNTING;
+    if (gAngleSemaphore != NULL) {
+        /* No angle task (no semaphore): the fire frame's drain still gets
+         * every angle into the shot. */
+        Task_Params_init(&taskParams);
+        taskParams.priority = L3_ANGLE_TASK_PRIORITY;
+        taskParams.stack = gAngleTaskStack;
+        taskParams.stackSize = sizeof(gAngleTaskStack);
+        Task_create(l3_angleTask, &taskParams, NULL);
+    }
+    gNoticeSemaphore = Semaphore_create(0, &semaphoreParams, NULL);
+    if (gNoticeSemaphore == NULL) {
+        return;
+    }
+    Task_Params_init(&taskParams);
+    taskParams.priority = L3_NOTICE_TASK_PRIORITY;
+    taskParams.stackSize = 2U * 1024U;
+    Task_create(l3_noticeTask, &taskParams, NULL);
 #endif
 
     /* CLI with the mmWave extension. */
     cliCfg.cliPrompt             = "l3dump:/>";
 #ifdef HYBRID_CADENCE_CAPTURE
-    cliCfg.cliBanner             = "OpenFlight hybrid-cadence L3 firmware (v6)\n";
+    cliCfg.cliBanner             = "OpenFlight hybrid-cadence L3 firmware (v6) "
+                                   L3_FW_VERSION " " L3_FW_GIT "\n";
 #else
-    cliCfg.cliBanner             = "OpenFlight configurable L3 snapshot firmware (v5)\n";
+    cliCfg.cliBanner             = "OpenFlight configurable L3 snapshot firmware (v5) "
+                                   L3_FW_VERSION " " L3_FW_GIT "\n";
 #endif
     cliCfg.cliUartHandle         = gCliUart;
     cliCfg.socHandle             = gSocHandle;
@@ -3456,7 +6606,7 @@ static void l3_initTask(UArg arg0, UArg arg1)
     cliCfg.tableEntry[2].helpString    = "Freeze and stream one L3 snapshot dump";
     cliCfg.tableEntry[2].cmdHandlerFxn = l3_cli_dump;
     cliCfg.tableEntry[3].cmd           = "stats";
-    cliCfg.tableEntry[3].helpString    = "Report capture counters";
+    cliCfg.tableEntry[3].helpString    = "stats [version]: capture counters, or firmware version";
     cliCfg.tableEntry[3].cmdHandlerFxn = l3_cli_stats;
 #ifdef ENABLE_HWA_SMOKE
     cliCfg.tableEntry[4].cmd           = "hwastats";
@@ -3469,7 +6619,6 @@ static void l3_initTask(UArg arg0, UArg arg1)
     cliCfg.tableEntry[6].helpString    = "Run HWA FFT on current ADCBUF chirp";
     cliCfg.tableEntry[6].cmdHandlerFxn = l3_cli_hwaReal;
 #endif
-#ifdef CONFIGURABLE_CAPTURE
     cliCfg.tableEntry[7].cmd           = "captureCfg";
     cliCfg.tableEntry[7].helpString    =
         "captureCfg preStart preBins postStart postBins lateStart postFrames [postStride]";
@@ -3481,7 +6630,7 @@ static void l3_initTask(UArg arg0, UArg arg1)
     cliCfg.tableEntry[8].cmdHandlerFxn = l3_cli_phaseCaptureCfg;
 #ifdef L3_RING_IQ8
     cliCfg.tableEntry[9].cmd           = "captureFormat";
-    cliCfg.tableEntry[9].helpString    = "captureFormat iq16|iq8";
+    cliCfg.tableEntry[9].helpString    = "captureFormat iq16|iq8|compact16|adaptive16";
     cliCfg.tableEntry[9].cmdHandlerFxn = l3_cli_captureFormat;
 #ifdef L3_IQ8_EDMA_PACK
     cliCfg.tableEntry[10].cmd           = "iq8Scale";
@@ -3489,7 +6638,34 @@ static void l3_initTask(UArg arg0, UArg arg1)
     cliCfg.tableEntry[10].cmdHandlerFxn = l3_cli_iq8Scale;
 #endif
 #endif
-#endif
+    cliCfg.tableEntry[11].cmd           = "l3sparse";
+    cliCfg.tableEntry[11].helpString    = "Freeze, send residual power, then requested cells";
+    cliCfg.tableEntry[11].cmdHandlerFxn = l3_cli_sparse;
+    cliCfg.tableEntry[12].cmd           = "triggerCfg";
+    cliCfg.tableEntry[12].helpString    =
+        "triggerCfg <globalBin> <snr> <on> [approach past stat]";
+    cliCfg.tableEntry[12].cmdHandlerFxn = l3_cli_triggerCfg;
+    cliCfg.tableEntry[13].cmd           = "l3track";
+    cliCfg.tableEntry[13].helpString    = "Freeze, pick ball and club cells on-chip, send them";
+    cliCfg.tableEntry[13].cmdHandlerFxn = l3_cli_track;
+    cliCfg.tableEntry[14].cmd           = "trackCfg";
+    cliCfg.tableEntry[14].helpString    = "trackCfg <loopPeriodS> <rangeResM> <maxRangeM> <clubLoM> <clubHiM> or cal/elem/impact/impactFit ...";
+    cliCfg.tableEntry[14].cmdHandlerFxn = l3_cli_trackCfg;
+    cliCfg.tableEntry[15].cmd           = "debugCfg";
+    cliCfg.tableEntry[15].helpString    = "debugCfg <0|1> stream trigger decisions";
+    cliCfg.tableEntry[15].cmdHandlerFxn = l3_cli_debugCfg;
+    cliCfg.tableEntry[16].cmd           = "l3release";
+    cliCfg.tableEntry[16].helpString    = "Rearm a self-trigger freeze without streaming";
+    cliCfg.tableEntry[16].cmdHandlerFxn = l3_cli_release;
+    /* Entries 0..18 plus the mmWave extension's commands must fit the SDK's
+     * CLI_MAX_CMD; keep new diagnostics as sub-modes of existing commands. */
+    cliCfg.tableEntry[18].cmd           = "ball";
+    cliCfg.tableEntry[18].helpString    =
+        "ball [status] | ball scan <firstBin> <count> | ball cfg <enable> <follow> [...]";
+    cliCfg.tableEntry[18].cmdHandlerFxn = l3_cli_ball;
+    cliCfg.tableEntry[17].cmd           = "triggerLog";
+    cliCfg.tableEntry[17].helpString    = "triggerLog [trace|track|shot|result|perf|timing|frames|cal|clear]: floor, trace, club, shot, result, perf, detect timing, stored frames, calibration";
+    cliCfg.tableEntry[17].cmdHandlerFxn = l3_cli_triggerLog;
     CLI_open(&cliCfg);
 }
 

@@ -136,8 +136,23 @@ class TestMonitorInstallsFactory:
         class FakeRadar:
             port = "/dev/fake"
 
-            def send_config(self, path):
+            def firmware_version(self):
+                return None
+
+            def send_config(self, path, lines=None):
                 pass
+
+            def set_tee_band(self, bins):
+                return True
+
+            def set_ball_snr(self, snr):
+                return True
+
+            def set_radar_cal(self, args):
+                return True
+
+            def set_elements(self, phases, gains):
+                return True
 
             def close(self):
                 pass

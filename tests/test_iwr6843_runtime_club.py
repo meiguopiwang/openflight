@@ -32,6 +32,7 @@ class FakeCapture:
     trigger_timestamp = 1.0
     dump_duration_s = 5.3
     sequence = 1
+    noise_power = None
 
 
 class FakeMonitor:
@@ -143,6 +144,32 @@ def test_ops_guided_estimator_warns_when_a_speed_mismatch_has_no_replacement():
 
     assert result.measurement.angle_deg == pytest.approx(10.7)
     assert result.measurement.status == "accepted_track_speed_warning"
+
+
+def test_ops_guided_estimator_withholds_a_track_that_is_not_the_ball():
+    """A ~55 mph tee track must not publish a launch for a ~150 mph ball.
+
+    On the 2026-08-24 Trackman drivers those walks read 14 to 19 deg high,
+    and no OPS-speed candidate was available to replace them.
+    """
+    baseline = LCMFResult(status="accepted", angle_deg=27.7, track_speed_mph=55.0)
+
+    with (
+        patch("openflight.iwr6843.runtime.estimate_lcmf_v1", return_value=baseline),
+        patch(
+            "openflight.iwr6843.runtime.find_recovery_candidates",
+            return_value=[],
+        ),
+    ):
+        result = _runtime().process_shot(
+            impact_timestamp=1.0,
+            ball_speed_mph=150.0,
+            club="driver",
+        )
+
+    assert result.measurement.status == "rejected_track_speed"
+    assert result.measurement.accepted is False
+    assert result.measurement.angle_deg == pytest.approx(27.7)
 
 
 def test_ops_guided_estimator_preserves_baseline_when_candidate_search_fails():
@@ -513,3 +540,71 @@ def test_azimuth_offset_corrects_horizontal_ball_launch():
 
     assert result.measurement.horizontal_deg == pytest.approx(0.3)
     assert result.measurement.horizontal_raw_deg == pytest.approx(3.3)
+
+
+def test_sparse_noise_floor_reaches_the_prepared_capture():
+    """Without it, the sparse cube's own median noise would be ~0."""
+
+    class NoisyCapture(FakeCapture):
+        noise_power = 7.5
+
+    class NoisyMonitor(FakeMonitor):
+        def capture_for_shot(self, _ts, timeout_s):
+            return NoisyCapture()
+
+    noise_calls = []
+    vertical = SimpleNamespace(set_noise_power=noise_calls.append)
+    runtime = IWR6843Runtime(
+        capture_monitor=NoisyMonitor(),
+        calibration=object(),
+        net_range_m=4.064,
+    )
+    with (
+        patch(
+            "openflight.iwr6843.runtime.prepare_lcmf_capture",
+            return_value=SimpleNamespace(vertical=vertical),
+        ),
+        patch("openflight.iwr6843.runtime.estimate_lcmf_v1", return_value=None),
+    ):
+        runtime.process_shot(impact_timestamp=1.0, ball_speed_mph=100.0, club="7i")
+
+    assert noise_calls == [7.5]
+
+
+def test_full_dump_keeps_its_own_noise_floor():
+    noise_calls = []
+    runtime = _runtime()
+    with (
+        patch(
+            "openflight.iwr6843.runtime.prepare_lcmf_capture",
+            return_value=SimpleNamespace(
+                vertical=SimpleNamespace(set_noise_power=noise_calls.append)
+            ),
+        ),
+        patch("openflight.iwr6843.runtime.estimate_lcmf_v1", return_value=None),
+    ):
+        runtime.process_shot(impact_timestamp=1.0, ball_speed_mph=100.0, club="7i")
+
+    assert noise_calls == []
+
+
+def test_onboard_only_capture_skips_the_host_pipeline_and_keeps_the_result():
+    """Not --debug there is no readback: no LCMF, no club path, the board's result intact."""
+    result = SimpleNamespace(verdict="valid")
+    capture = SimpleNamespace(
+        valid=False, raw=None, onboard_only=True, onboard_result=result, error=None
+    )
+    runtime = IWR6843Runtime(
+        capture_monitor=SimpleNamespace(capture_for_shot=lambda _ts, timeout_s: capture),
+        calibration=object(),
+        net_range_m=4.064,
+    )
+
+    with patch("openflight.iwr6843.runtime.estimate_lcmf_v1") as lcmf:
+        shot_result = runtime.process_shot(
+            impact_timestamp=1.0, ball_speed_mph=100.0, club="7i", club_speed_mph=80.0
+        )
+
+    lcmf.assert_not_called()
+    assert shot_result.measurement is None and shot_result.club_path is None
+    assert shot_result.onboard is result

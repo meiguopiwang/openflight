@@ -198,7 +198,9 @@ def _restart_iwr6843(monkeypatch, tmp_path, *, tilt_deg=None):
         def __init__(self, **_kwargs):
             self.port = "/dev/ttyUSB0"
 
-        def start(self, *, armed=True):
+        def start(self, *, armed=True, onboard_track_config=None):
+            self.self_trigger = None
+            self.onboard_tracking = False
             return None
 
         def stop(self):

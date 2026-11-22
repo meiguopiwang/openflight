@@ -71,6 +71,7 @@ ble = [
 [project.scripts]
 openflight-server = "openflight.server:main"
 openflight-cloud = "openflight.cloud.cli:main"
+openflight-firmware = "openflight.iwr6843.firmware_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/open-flight/openflight"
@@ -94,6 +95,8 @@ dev = [
     "pre-commit>=4.0.0",
     "pytest>=9.0.3",
     "ruff>=0.1.0",
+    # zig cc builds the firmware host modules on Windows, which ships no C compiler.
+    "ziglang>=0.13.0; sys_platform == 'win32'",
 ]
 # Documentation site. Zensical is pre-1.0, so pin the minor to keep CI and
 # local builds on the same renderer.
@@ -116,12 +119,12 @@ ignore = ["E501"]  # Line length handled separately
 combine-as-imports = true
 
 [tool.uv]
-# OpenFlight's declared platforms are Linux (the Pi) and macOS (development).
-# Excluding Windows also keeps Linux-only Bless resolution from traversing its
-# incompatible Windows beta dependency branch.
+# Linux is the Pi, macOS and Windows are development and offline analysis.
+# Bless stays Linux-only, so its Windows beta dependency branch is not resolved.
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'darwin'",
+    "sys_platform == 'win32'",
 ]
 # Prefer the distro interpreter over uv-managed ones. On the Pi the venv must
 # be built from /usr/bin/python3 so apt-installed Picamera2/libcamera stay

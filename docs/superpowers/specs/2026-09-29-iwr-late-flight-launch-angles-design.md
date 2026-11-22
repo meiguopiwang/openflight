@@ -1,0 +1,217 @@
+# IWR6843 late-flight onboard launch angles — design
+
+Base: `feat/iwr-calcs`. Approved in conversation 2026-09-29 (option 8A of the
+angle investigation); this is the written spec for review.
+
+## Intent
+
+The board should report launch angles (VLA/HLA) that can be trusted, taken
+from the part of the ball's flight where the floor reflection no longer flips
+them. Launch speed keeps today's early fit (0.87–1.13× OPS on the good
+tracks). Success is agreement with the host's LCMF-v1 angle, and an explicit
+"no angles" when a track has too few late points. The Pi keeps preferring its
+own LCMF angle by default; this makes the onboard angle usable and honest.
+
+## Problem (measured 2026-09-29)
+
+On 51 ball-visible captures the firmware never produces launch angles: the
+launch fit's angle-residual check rejects them on every one, correctly.
+
+- Per-point ball angles scatter (median SD over the first 6 points: azimuth
+  27°, elevation 12°) while the range walk is tight (0.024 m).
+- Stage-by-stage against the host chain (18 good tracks, 7 where both
+  pipelines follow the same return): the host chain itself flips in the
+  firmware's launch window (median detrended elevation scatter 5.1°) and is
+  clean later (1.1°). The firmware's own chain: 8.0° on points 1–5, 1.5° on
+  points 6+. Cause: near launch the ball is low and close, so the direct path
+  and its floor image arrive together and the estimate jumps between them;
+  the firmware fits launch angles from the first `launchPoints` (6) points.
+- Secondary, from swapping one host stage into a firmware replica: TDM and
+  loop phase from the range walk instead of the lag-1 branch (scatter 9.1° →
+  7.4°, bias −6.0° → −1.8°); element calibration (bias −3.9°); MUSIC-high
+  (6.9°). The Pi sends neither `trackCfg cal` nor `trackCfg elem`, so the
+  board also runs with radar pitch 0 on a rig tilted ~10.4°.
+- On 9 of the 18 good-speed tracks the firmware and host ball tracks are
+  4–22 bins apart: different returns.
+
+## A. Firmware
+
+Files: `l3_ball_track.h/.c`, `l3_club_track.h/.c` (fit helper, if needed),
+`l3_angle.h/.c`, `l3_dump.c`, tests.
+
+- **Late-flight launch fit.** `l3_ball_track_launch`:
+  - Speed and the range-only fallback: today's fit over the first
+    `launchPoints`, unchanged (same speed, residual and confidence).
+  - Angles: a second `l3_delivery_fit` over only the points whose range is
+    at least `lateRangeM` beyond the ball's origin range (the range the
+    tracker was armed at). `lateRangeM` is a new `l3_ball_track_cfg_t` field
+    (last field), default chosen from the captures in the plan's sweep,
+    starting value 0.6 m.
+  - VLA/HLA come from that fit's velocity direction. They are valid only when
+    the late fit has at least 3 points carrying the angles it reads and the
+    existing angle-residual check (`maxAngleResidualM`) passes; otherwise
+    they are invalid while the speed stays reported.
+  - `l3_launch_t` gains `lateFrom` (index of the first point used, or 0xFF
+    when no late fit), shown in the ball status line.
+- **TDM from the track rate.** `l3_angle_snapshot_t` gains
+  `uint8_t continuousTdm` (0 by `l3_angle_snapshot_init`). When set, the
+  per-TX correction is
+  4π·v·τ/λ with v the caller's radial velocity, not snapped to a lag-1
+  branch. Ball points pass v = the ball track's fitted range rate
+  (`l3_track_recent_rate(&gBallTrack.core)`), and the loop-summing phase in
+  the channel snapshot uses the same v (3 chirps per loop). Callers without a
+  track rate (the club, the first ball point) keep today's branch snap, so
+  club behaviour is unchanged.
+- **Calibration.** `trackCfg cal` and `trackCfg elem` already exist and
+  persist across `triggerCfg` and `sensorStart` (checked by tests, fixed if
+  not).
+- Board and replay make identical calls. DATA_RAM checked in the
+  `openflight-iwr-sdk` Docker image.
+
+## B. Pi
+
+Files: `driver.py`, `monitor.py`, `server.py`, `shot_result.py`, docs.
+
+- **Driver.** `set_radar_cal(pitch_deg, yaw_deg, roll_deg, az_offset_rad,
+  el_offset_deg)` sends `trackCfg cal …`; `set_elements(phases, gains)` sends
+  `trackCfg elem <i> <phaseRad> <gain>` for i = 0..7. Both use
+  `_set_track_cfg_sub_mode`: old firmware refusing the identity value returns
+  False; any other refusal, and silence, raise.
+- **Monitor.** New `board_calibration: BoardCalibration | None` (frozen
+  dataclass: pitch/yaw/roll degrees, azimuth offset rad, elevation offset
+  degrees, 8 phases, 8 gains; identity when None). Sent at every start after
+  the band and ball snr, identity included, so a restart clears stale values.
+  When firmware predates the commands: warning, start continues, and the
+  monitor records `calibration_applied = False`.
+- **Uncalibrated angles are never used.** With `calibration_applied` False,
+  the onboard VLA/HLA are treated as implausible for that session
+  (`shot_result`/server), so `_apply_onboard_metrics` never copies them.
+- **Server.** `init_iwr6843` builds `BoardCalibration` from the same
+  `Calibration` object it already loads and adjusts (`--iwr6843-tilt-deg`,
+  `--iwr6843-azimuth-offset-deg`), so board and host LCMF share one source.
+  No new flags. The session log records the calibration sent.
+
+## C. Replay, viewer, evaluator
+
+Files: `firmware_replay.py`, `dump_viewer.py`, `scripts/iwr6843/dump_viewer.*`,
+`scripts/analysis/evaluate_iwr_tracking.py`, tests.
+
+- `ReplayConfig` gains `elem_phase_rad` / `elem_gain` (None = identity, as
+  the recordings were made) and `late_range_m` (None = firmware default). One
+  helper loads the calibration file into these (and pitch), shared by the
+  viewer, the evaluator and the server's `BoardCalibration`.
+- The replay makes the same TDM-from-track-rate call as the board.
+- Viewer defaults to the board's behaviour: calibration file applied; new
+  `late range (m)` box; the launch angles and `lateFrom` shown.
+- Evaluator `--angles`: replays with the calibration file and compares
+  onboard VLA/HLA with host LCMF-v1 per ball-visible capture; reports median
+  |ΔVLA|, share within 5°, HLA vs LCMF horizontal, tracks with no angles, and
+  TrackMan comparisons where the session carries TrackMan values.
+
+## Testing
+
+TDD throughout; each bullet is a failing test first.
+
+- **Late fit (C, host-built):** early points flipping ±15° with clean later
+  points give the clean launch angle; fewer than 3 late points, or late
+  points without angles, give no angles with the speed still reported; the
+  residual check still rejects scattered late points; `lateRangeM` measured
+  from the origin range; speed identical to today's early fit.
+- **TDM (C):** with a track rate the correction is continuous, including
+  beyond the ±63 m/s the branch search reaches; without one the branch snap
+  is unchanged; replay snapshot and C agree to float precision.
+- **Board wiring (source inspection):** the ball angle call passes the track
+  rate; the launch fit is configured with the late range; `trackCfg cal` and
+  `elem` persist across `triggerCfg`/`sensorStart`.
+- **Pi:** exact `trackCfg cal`/`elem` lines; old-firmware refusal and silence;
+  the monitor always sends the calibration after band and ball snr, identity
+  included; a refusal marks angles not applied and the parser/server then
+  treat onboard VLA/HLA as unusable; the server builds `BoardCalibration`
+  from the same object LCMF uses and `--iwr6843-tilt-deg` reaches both.
+- **Replay/viewer:** calibration file loads into `ReplayConfig`; None is
+  identity; viewer defaults to calibrated; the synthetic shot's late-flight
+  VLA matches its synthesized launch angle.
+
+## Acceptance
+
+Replay the ball-visible OF Sessions captures with the calibration file.
+
+- Gate: median |onboard VLA − LCMF VLA| ≤ 3° and at least 70% within 5°,
+  over captures where both exist.
+- Reported alongside: HLA vs LCMF horizontal; tracks with no angles; results
+  against TrackMan where available; the `lateRangeM` sweep used to choose the
+  default.
+- A miss is recorded as FAIL with the numbers; no tuning beyond that sweep.
+- No new failures in the full suite beyond the recorded baseline; DATA_RAM
+  checked.
+
+## Risks
+
+- Short tracks (6 of the 18 good tracks have under 10 points) will honestly
+  report no angles.
+- Where the firmware follows a different return from the host (9 of 18), its
+  angles disagree with LCMF; these count against the gate, not excluded.
+- Firmware and Pi must update together: old firmware on a new Pi warns and
+  shows no onboard angles; a new board on an old Pi runs uncalibrated. The
+  changelog says so.
+
+## Outcome (2026-09-29): stopped after Task 4
+
+Built (commits on feat/iwr-calcs):
+
+- Launch angles are fitted only from ball points at least `lateRangeM`
+  (0.6 m) past the ball; the speed keeps the early fit (Task 2).
+- The TDM branch for ball and ball-hypothesis angles is picked with the
+  fitted track rate instead of the two-point velocity; the measured lag-1
+  phase stays the loop rotor (Task 3, ruled "V3"). The continuous TDM mode
+  of Task 1 was removed: a continuous per-chirp correction from the fitted
+  rate biased the synthetic 12 deg launch to 18.5 deg.
+- The replay takes element calibration (`ReplayConfig.elem_phase_rad` /
+  `elem_gain`) and `late_range_m` (Task 3).
+- The Pi sends `trackCfg cal` and `trackCfg elem` from the calibration file
+  at every start (`board_calibration.py`); firmware without them warns and
+  its onboard launch angles are doubted for the session (Task 4).
+
+Measured on the 18 good ball tracks of the OF Sessions captures, replayed
+with the calibration file, against host LCMF-v1:
+
+| Variant | Tracks with launch angles | Median abs(VLA - LCMF) | Within 5 deg |
+|---|---|---|---|
+| 3D late fit (any TDM variant) | 0 / 18 | - | - |
+| Elevation-only late fit, 0.6 m | 3 / 18 | 2.3 deg | 2 / 3 |
+| Elevation-only late fit, 1.0 m | 8-9 / 18 | 6.2-6.4 deg | 2 / 8-9 |
+
+- In the late window the azimuth still scatters 15-50 deg (SD over the late
+  points) and the fitted positions' y residual is 0.2-1.7 m against the
+  0.094 m limit, so the 3D fit is rejected on every track.
+- Gate (median <= 3 deg and >= 70% within 5 deg): FAIL. Per-point
+  single-source angles do not give usable launch angles on these captures;
+  the host gets them only by fitting the whole trajectory with the two-ray
+  (direct + floor) model (LCMF-v1), which stays the launch-angle source.
+- Not done: `evaluate_iwr_tracking.py --angles`, the viewer's calibration
+  default, the `lateRangeM` sweep, the acceptance JSONs, the DATA_RAM check
+  for this plan's firmware changes. TrackMan: no labelled reference shots in
+  `tests/radar/datasets/`; not measured.
+
+Final review corrections:
+
+- The late fit can pass with wrong angles: on recording 20260916_190937 it
+  gave onboard HLA +22 to +24 deg against -0.9 deg from the early fit. The
+  Pi never uses onboard launch angles (`--iwr6843-onboard-metrics` now
+  prefers only the firmware's club path and attack); LCMF-v1 is the only
+  launch-angle source.
+- A calibrated board shifts its onboard geometry (club positions, club
+  path and attack include the tilt; the range bias is applied), while
+  replays default to identity, so a replay of a new capture differs from the
+  board unless the session's recorded `board_calibration` is applied. The
+  inclinometer's live tilt is not sent to the board.
+- The azimuth phase offset is sent as 0: the firmware subtracts
+  `azimuthOffsetRad` in both `l3_angle.c` and `l3_frames.c`, so a non-zero
+  value would be applied twice (tracked separately).
+- Firmware that refuses `trackCfg cal`/`elem` logs a warning and its onboard
+  launch angles, club path and attack are doubted; refusing an identity
+  calibration is silent, since an uncalibrated board already runs identity.
+- The `lateFrom` no-late sentinel is now set on every launch reset in
+  `l3_dump.c` and in `l3_joint_launch`.
+- DATA_RAM after these changes (TI SDK image, `make build-native`): 563 B
+  free of 0x30000 (651 B before the late-flight plan).

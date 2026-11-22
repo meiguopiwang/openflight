@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 
 LOOP_PRI_S = 90e-6  # TX1-to-next-TX1 loop period for the 2TX config
+CHIRP_PERIOD_S = 45e-6  # profileCfg idle 7 us + ramp end 38 us, every shipped cfg
 RANGE_SPAN_M = 6.0  # every cfg keeps a 6 m span: bin = 6.0/n_samples
 BALL_GATES_M = ((2.25, 3.75), (3.75, 5.5))
 SPEED_BOUNDS_MS = (20.0, 90.0)
@@ -26,10 +27,24 @@ SPEED_BOUNDS_MS = (20.0, 90.0)
 # clubhead ~0.7x ball) outlast the ball in the gates and win most-inliers
 # RANSAC. 2026-07-14 TrackMan session: 5 driver + several SW live tracks
 # stolen this way. A fast track wins if it has enough support of its own.
+# Keep ball tracks this far short of the net: a ball riding up the net is an
+# upward mover that tilts every angle fit high.
+NET_CLEARANCE_M = 0.25
 FAST_TRACK_MS = 26.5  # RADIAL m/s: slowest real SW ball reads ~27.5
 #                               (66 mph x cos projection); flying tee ~25
 FAST_SUPPORT_FRAC = 0.55  # of the most-inliers candidate
 MAX_RADIAL_ACCEL = 200.0  # m/s^2 sanity for the quadratic refit
+
+
+def same_tx_loop_period_s(n_tx: int, chirp_period_s: float = CHIRP_PERIOD_S) -> float:
+    """Time between chirps from the same transmitter: one chirp per active TX.
+
+    Rows keep this physical timing even when a readback carries only the
+    vertical TX pair of a 3-TX loop.
+    """
+    if n_tx < 1:
+        raise ValueError(f"loop needs at least one transmitter, got {n_tx}")
+    return n_tx * chirp_period_s
 
 
 @dataclass
@@ -304,7 +319,50 @@ def find_ball(
     restrict the search to pre-impact frames — otherwise this fitter will
     happily lock onto the ball instead of the club.
     """
-    power = loop_power(mti)
+    return find_ball_from_power(
+        loop_power(mti),
+        geo,
+        iterations=iterations,
+        seed=seed,
+        max_range_m=max_range_m,
+        min_ball_ms=min_ball_ms,
+        gates_m=gates_m,
+        speed_bounds_ms=speed_bounds_ms,
+        time_window_s=time_window_s,
+    )
+
+
+def track_max_range_m(net_range_m: float | None) -> float | None:
+    """Farthest range a ball track may use, or None when no net clamps it."""
+    if not net_range_m:
+        return None
+    return net_range_m - NET_CLEARANCE_M
+
+
+def detection_peaks(
+    power: np.ndarray,
+    geo: Geometry,
+    *,
+    max_range_m: float | None = None,
+    gates_m: tuple[tuple[float, float], ...] = BALL_GATES_M,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-loop peak bins inside ``gates_m``. Rows are ``frame * loops + loop``."""
+    return _detections(power, geo, max_range_m=max_range_m, gates_m=gates_m)
+
+
+def find_ball_from_power(
+    power: np.ndarray,
+    geo: Geometry,
+    *,
+    iterations: int = 2500,
+    seed: int = 1,
+    max_range_m: float | None = None,
+    min_ball_ms: float = FAST_TRACK_MS,
+    gates_m: tuple[tuple[float, float], ...] = BALL_GATES_M,
+    speed_bounds_ms: tuple[float, float] = SPEED_BOUNDS_MS,
+    time_window_s: tuple[float, float] | None = None,
+) -> BallTrack | None:
+    """RANSAC a range walk from residual power ``[frames * loops, bins]``."""
     loops_idx, bins = _detections(power, geo, max_range_m=max_range_m, gates_m=gates_m)
     if loops_idx.size < 8:
         return None

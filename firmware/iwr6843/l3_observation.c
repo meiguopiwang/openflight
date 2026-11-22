@@ -1,0 +1,258 @@
+/* IWR6843 radar observation layer. See l3_observation.h. */
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "l3_observation.h"
+#include "l3_text.h"
+
+float l3_obs_stat(uint32_t stat, const l3_bin_obs_t *obs)
+{
+    return (stat == L3_OBS_STAT_PEAK) ? obs->peak : obs->energy;
+}
+
+float l3_obs_parabolic_offset(float left, float centre, float right)
+{
+    float denominator;
+    float offset;
+
+    /* In the log domain when every value is positive: a Gaussian-shaped lobe
+     * is then fitted exactly, and on the unwindowed range FFT's sinc^2 lobe
+     * the log parabola's worst error is 0.17 bin against 0.28 for the
+     * linear one (tests/test_iwr6843_firmware_iq16_stats.py). */
+    if (left > 0.0F && centre > 0.0F && right > 0.0F) {
+        left = logf(left);
+        centre = logf(centre);
+        right = logf(right);
+    }
+    denominator = left - 2.0F * centre + right;
+    if (denominator >= 0.0F) {
+        return 0.0F;  /* not a maximum: flat or a valley */
+    }
+    offset = 0.5F * (left - right) / denominator;
+    if (offset > 0.5F) {
+        offset = 0.5F;
+    } else if (offset < -0.5F) {
+        offset = -0.5F;
+    }
+    return offset;
+}
+
+/* Static: the caller's task stack is small and only one task scores frames.
+ * Not reentrant. */
+static float gObsSorted[L3_OBS_MAX_BINS];
+
+/* The statistic over count bins into gObsSorted, ascending; returns the count
+ * kept. Insertion sort: the region is a dozen or so bins, so this is cheaper
+ * than anything cleverer. */
+static uint32_t l3_obs_sort(uint32_t stat, const l3_bin_obs_t *obs, uint32_t count)
+{
+    uint32_t i;
+
+    if (count > L3_OBS_MAX_BINS) {
+        count = L3_OBS_MAX_BINS;
+    }
+    for (i = 0U; i < count; i++) {
+        float value = l3_obs_stat(stat, &obs[i]);
+        uint32_t j = i;
+        while (j > 0U && gObsSorted[j - 1U] > value) {
+            gObsSorted[j] = gObsSorted[j - 1U];
+            j--;
+        }
+        gObsSorted[j] = value;
+    }
+    return count;
+}
+
+float l3_obs_median(uint32_t stat, const l3_bin_obs_t *obs, uint32_t count)
+{
+    if (count == 0U) {
+        return 0.0F;
+    }
+    count = l3_obs_sort(stat, obs, count);
+    if ((count & 1U) != 0U) {
+        return gObsSorted[count / 2U];
+    }
+    return 0.5F * (gObsSorted[count / 2U - 1U] + gObsSorted[count / 2U]);
+}
+
+float l3_obs_quantile(uint32_t stat, const l3_bin_obs_t *obs, uint32_t count, float fraction)
+{
+    uint32_t rank;
+
+    if (count == 0U) {
+        return 0.0F;
+    }
+    count = l3_obs_sort(stat, obs, count);
+    if (!(fraction > 0.0F)) {  /* also NaN */
+        fraction = 0.0F;
+    } else if (fraction > 1.0F) {
+        fraction = 1.0F;
+    }
+    rank = (uint32_t)(fraction * (float)(count - 1U) + 0.5F);
+    return gObsSorted[rank];
+}
+
+void l3_obs_floor_step(float *floor, float sample, uint32_t shift)
+{
+    if (*floor <= 0.0F) {
+        *floor = sample;
+    } else {
+        *floor += (sample - *floor) / (float)(1U << shift);
+    }
+    if (*floor < L3_OBS_FLOOR_MIN) {
+        *floor = L3_OBS_FLOOR_MIN;
+    }
+}
+
+void l3_obs_floor_update(float *floor, uint32_t stat, const l3_bin_obs_t *obs,
+                         uint32_t count, uint32_t shift)
+{
+    l3_obs_floor_step(floor, l3_obs_median(stat, obs, count), shift);
+}
+
+float l3_obs_velocity(float r1Re, float r1Im, float loopPeriodS)
+{
+    if (loopPeriodS <= 0.0F || (r1Re == 0.0F && r1Im == 0.0F)) {
+        return 0.0F;
+    }
+    return atan2f(r1Im, r1Re) * L3_OBS_WAVELENGTH_M / (4.0F * L3_OBS_PI * loopPeriodS);
+}
+
+static void l3_obs_fill(const l3_obs_params_t *params, uint32_t frame, uint32_t timestampUs,
+                        uint32_t firstBin, const l3_bin_obs_t *obs, uint32_t count,
+                        uint32_t index, float floor, float threshold, l3_target_obs_t *target)
+{
+    const l3_bin_obs_t *bin = &obs[index];
+    float stat = l3_obs_stat(params->stat, bin);
+    float weight = stat;
+    float moment = stat * (float)(firstBin + index);
+    float magnitude;
+    float margin;
+
+    memset(target, 0, sizeof(*target));
+    target->frame = frame;
+    target->timestampUs = timestampUs;
+    target->peakBin = (uint8_t)(firstBin + index);
+    /* Sub-bin range: the parabola's vertex through the peak and both
+     * neighbours when it has both (the main lobe of a windowed FFT is one to
+     * within a hundredth of a bin), else the statistic's centroid over the
+     * peak and its neighbours above the floor, so noise does not pull it. */
+    if (params->subBin == L3_OBS_SUBBIN_PARABOLIC && index > 0U && index + 1U < count) {
+        float left = l3_obs_stat(params->stat, &obs[index - 1U]);
+        float right = l3_obs_stat(params->stat, &obs[index + 1U]);
+
+        target->rangeBin = (float)(firstBin + index) + l3_obs_parabolic_offset(left, stat, right);
+    } else {
+        if (index > 0U) {
+            float side = l3_obs_stat(params->stat, &obs[index - 1U]) - floor;
+            if (side > 0.0F) {
+                weight += side;
+                moment += side * (float)(firstBin + index - 1U);
+            }
+        }
+        if (index + 1U < count) {
+            float side = l3_obs_stat(params->stat, &obs[index + 1U]) - floor;
+            if (side > 0.0F) {
+                weight += side;
+                moment += side * (float)(firstBin + index + 1U);
+            }
+        }
+        target->rangeBin = (weight > 0.0F) ? (moment / weight) : (float)(firstBin + index);
+    }
+    target->energy = bin->energy;
+    target->peak = bin->peak;
+    target->loop0 = bin->loop0;
+    target->stat = stat;
+    target->snr = stat / ((floor > 0.0F) ? floor : L3_OBS_FLOOR_MIN);
+    target->r1Re = bin->r1Re;
+    target->r1Im = bin->r1Im;
+    if (bin->energy > 0.0F) {
+        magnitude = sqrtf(bin->r1Re * bin->r1Re + bin->r1Im * bin->r1Im);
+        target->coherence = magnitude / bin->energy;
+        if (target->coherence > 1.0F) {
+            target->coherence = 1.0F;
+        }
+        target->dopplerPhaseRad = atan2f(bin->r1Im, bin->r1Re);
+    }
+    target->dopplerAliasMps = l3_obs_velocity(bin->r1Re, bin->r1Im, params->loopPeriodS);
+    target->anglesValid = 0U;
+    /* Confidence: how far the statistic clears the threshold (full at 3x
+     * over it), tempered by coherence (an incoherent rise is half a target). */
+    margin = (stat - threshold) / (3.0F * threshold);
+    if (margin > 1.0F) {
+        margin = 1.0F;
+    }
+    if (margin < 0.0F) {
+        margin = 0.0F;
+    }
+    target->confidence = margin * (0.5F + 0.5F * target->coherence);
+}
+
+uint32_t l3_obs_extract(const l3_obs_params_t *params, uint32_t frame, uint32_t timestampUs,
+                        uint32_t firstBin, const l3_bin_obs_t *obs, uint32_t count,
+                        float floor, l3_target_obs_t *out, uint32_t maxOut)
+{
+    float threshold = ((floor > 0.0F) ? floor : L3_OBS_FLOOR_MIN) * params->snr;
+    uint32_t written = 0U;
+    uint32_t i;
+
+    if (count > L3_OBS_MAX_BINS) {
+        count = L3_OBS_MAX_BINS;
+    }
+    for (i = 0U; i < count; i++) {
+        float stat = l3_obs_stat(params->stat, &obs[i]);
+        l3_target_obs_t target;
+        uint32_t slot;
+
+        if (stat < threshold) {
+            continue;
+        }
+        /* Local maximum: a plateau's first bin counts, its followers do not. */
+        if (i > 0U && l3_obs_stat(params->stat, &obs[i - 1U]) >= stat) {
+            continue;
+        }
+        if (i + 1U < count && l3_obs_stat(params->stat, &obs[i + 1U]) > stat) {
+            continue;
+        }
+        l3_obs_fill(params, frame, timestampUs, firstBin, obs, count, i, floor, threshold, &target);
+        /* Insert strongest first; drop the weakest when full. */
+        slot = written;
+        while (slot > 0U && out[slot - 1U].stat < target.stat) {
+            if (slot < maxOut) {
+                out[slot] = out[slot - 1U];
+            }
+            slot--;
+        }
+        if (slot < maxOut) {
+            out[slot] = target;
+            if (written < maxOut) {
+                written++;
+            }
+        }
+    }
+    return written;
+}
+
+int32_t l3_obs_format_target(const l3_target_obs_t *target, char *out, uint32_t cap)
+{
+    char rangeText[16];
+    char snrText[16];
+    char velocityText[16];
+    char confidenceText[16];
+    char energyText[16];
+    char peakText[16];
+
+    l3_text_fixed(target->rangeBin, 2U, rangeText, sizeof(rangeText));
+    l3_text_fixed(target->snr, 1U, snrText, sizeof(snrText));
+    l3_text_fixed(target->dopplerAliasMps, 2U, velocityText, sizeof(velocityText));
+    l3_text_fixed(target->confidence, 2U, confidenceText, sizeof(confidenceText));
+    l3_text_fixed(target->energy, 0U, energyText, sizeof(energyText));
+    l3_text_fixed(target->peak, 0U, peakText, sizeof(peakText));
+    return snprintf(out, cap,
+                    "obs frame=%u bin=%u range=%s snr=%s energy=%s peak=%s coh=%u v=%s "
+                    "conf=%s angles=%s",
+                    (unsigned)target->frame, (unsigned)target->peakBin, rangeText, snrText,
+                    energyText, peakText, (unsigned)(target->coherence * 100.0F + 0.5F),
+                    velocityText, confidenceText, target->anglesValid ? "valid" : "none");
+}

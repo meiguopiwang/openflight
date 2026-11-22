@@ -4,10 +4,25 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field, replace
+from typing import Callable
 
-from openflight.iwr6843.calibration import Calibration
-from openflight.iwr6843.club import ClubPathResult, ClubWindowPolicy, estimate_club_path
+from openflight.iwr6843 import tracking
+from openflight.iwr6843.calibration import DEFAULT_TEE_RANGE_M, Calibration
+from openflight.iwr6843.club import (
+    ClubPathResult,
+    ClubWindowPolicy,
+    club_gate_m,
+    estimate_club_path,
+)
+from openflight.iwr6843.late_window import (
+    LateWindowPlan,
+    capture_late_window,
+    net_gate_m,
+    plan_late_window,
+    planner_mode,
+)
 from openflight.iwr6843.lcmf import (
     LCMFResult,
     PreparedLCMFCapture,
@@ -20,6 +35,13 @@ from openflight.iwr6843.recovery import (
     RecoveryPrior,
     find_recovery_candidates,
     select_recovery_candidate,
+)
+from openflight.iwr6843.sparse import (
+    PowerSummary,
+    SparsePlan,
+    expand_cells,
+    noise_cells,
+    track_cells,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +58,18 @@ _TDM_SIGN_BY_POLICY = {"positive": 1, "negative": -1, "auto": 1}
 OPS_TRACK_SPEED_TOLERANCE_FRAC = 0.15
 OPS_GUIDED_MAX_CANDIDATES = 8
 OPS_GUIDED_MIN_LAUNCH_DEG = 2.0
+# Recovery already failed. Past this disagreement the range walk is a
+# different object: on the 2026-08-24 drivers a ~55 mph tee track against a
+# ~150 mph ball published launch angles 14 to 19 deg high. A milder miss,
+# such as 30%, still publishes as accepted_track_speed_warning.
+OPS_TRACK_SPEED_REJECT_FRAC = 0.40
+
+
+def _unrepaired_speed_mismatch(baseline: LCMFResult, speed_error: float) -> LCMFResult:
+    """Keep a mild speed miss, and withhold a range walk that is not the ball."""
+    if speed_error > OPS_TRACK_SPEED_REJECT_FRAC:
+        return replace(baseline, status="rejected_track_speed")
+    return replace(baseline, status="accepted_track_speed_warning")
 
 
 def _ops_candidate_rank(candidate: RecoveryCandidate) -> tuple[float, int, float]:
@@ -104,6 +138,11 @@ class IWR6843ShotResult:
     measurement: LCMFResult | None
     club_path: ClubPathResult | None = None
 
+    @property
+    def onboard(self):
+        """The firmware's own result packet for the shot, when the capture carried one."""
+        return getattr(self.capture, "onboard_result", None)
+
 
 @dataclass
 class IWR6843Runtime:
@@ -112,6 +151,7 @@ class IWR6843Runtime:
     capture_monitor: IWR6843CaptureMonitor
     calibration: Calibration
     net_range_m: float | None
+    flight_mode: str = "net"
     tx_order: str = "normal"
     capture_timeout_s: float = 12.0
     azimuth_offset_deg: float = 0.0
@@ -128,6 +168,77 @@ class IWR6843Runtime:
     # vertical solution may use that prior to recover impact timing for the
     # independent experimental club search, never to publish vertical launch.
     recovery_observations: list[tuple[float, float, float]] = field(default_factory=list)
+
+    @property
+    def self_trigger_enabled(self) -> bool:
+        """True when the firmware trigger, not the sound gate, starts shots."""
+        return self.capture_monitor.watch_self_trigger
+
+    @property
+    def tracking_net_m(self) -> float | None:
+        """Net clamp for ball tracks. Open flight does not apply one."""
+        return net_gate_m(self.flight_mode, self.net_range_m)
+
+    def plan_late_window(
+        self,
+        *,
+        ball_speed_mph: float,
+        launch_angle_deg: float | None,
+        spin_rpm: float | None,
+    ) -> LateWindowPlan | None:
+        """Late looks for an open-flight shot, or None in a net or without a launch."""
+        mode = planner_mode(self.flight_mode)
+        if mode is None or launch_angle_deg is None:
+            return None
+        plan = plan_late_window(
+            mode,
+            ball_speed_mph,
+            launch_angle_deg,
+            spin_rpm or 0.0,
+            self.calibration.tee_range_m or DEFAULT_TEE_RANGE_M,
+        )
+        return plan if plan.enabled else None
+
+    def measure_late_window(
+        self,
+        plan: LateWindowPlan,
+        *,
+        impact_timestamp: float,
+        on_measured: Callable[[dict | None], None],
+    ) -> bool:
+        """Queue the late looks on the capture worker, which owns the radar.
+
+        ``on_measured`` runs on that worker with the measurement, or None when
+        the look was missed or failed. Returns False when nothing was queued.
+        """
+        monitor = self.capture_monitor
+        tee_range_m = self.calibration.tee_range_m or DEFAULT_TEE_RANGE_M
+
+        def measure(_radar) -> None:
+            result: dict | None = None
+            try:
+
+                def capture(radar) -> None:
+                    nonlocal result
+                    result = capture_late_window(
+                        radar,
+                        plan,
+                        impact_timestamp=impact_timestamp,
+                        tee_range_m=tee_range_m,
+                        restore_cfg=str(monitor.config_path),
+                        now=time.time,
+                        sleep=time.sleep,
+                    )
+
+                monitor.run_on_other_profile(capture)
+                if result is not None:
+                    logger.info("[IWR6843] Late window timing: %s", result.get("timing_s"))
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("[IWR6843] Late-window measurement failed", exc_info=True)
+                result = None
+            on_measured(result)
+
+        return monitor.submit("late-window", measure)
 
     def _remember_recovery_observation(
         self, measurement: LCMFResult, ball_speed_mph: float
@@ -160,7 +271,7 @@ class IWR6843Runtime:
                 raw,
                 calibration,
                 ball_speed_mph=ball_speed_mph,
-                net_range_m=self.net_range_m,
+                net_range_m=self.tracking_net_m,
             )
         except ValueError:
             # Older/raw-ADC firmware formats cannot run the snapshot recovery.
@@ -197,14 +308,14 @@ class IWR6843Runtime:
                     raw,
                     calibration,
                     ball_speed_mph=ball_speed_mph,
-                    net_range_m=self.net_range_m,
+                    net_range_m=self.tracking_net_m,
                     prepared=prepared.vertical,
                 )
             )
         except Exception as error:  # pylint: disable=broad-exception-caught
             logger.warning("[IWR6843] OPS-guided track search failed: %s", error)
             if baseline.accepted:
-                return replace(baseline, status="accepted_track_speed_warning")
+                return _unrepaired_speed_mismatch(baseline, speed_error)
             return baseline
         recoveries: list[tuple[RecoveryCandidate, LCMFResult]] = []
         for candidate in candidates:
@@ -213,7 +324,7 @@ class IWR6843Runtime:
                 calibration,
                 ball_speed_mph=ball_speed_mph,
                 club=club,
-                net_range_m=self.net_range_m,
+                net_range_m=self.tracking_net_m,
                 tx_order=self.tx_order,
                 tdm_sign_policy=self.tdm_sign_policy,
                 horizontal_phase_reference_rad=self.horizontal_phase_reference_rad,
@@ -241,8 +352,90 @@ class IWR6843Runtime:
             )
             return replace(selected, status=status)
         if baseline.accepted:
-            return replace(baseline, status="accepted_track_speed_warning")
+            return _unrepaired_speed_mismatch(baseline, speed_error)
         return baseline
+
+    def _ball_max_range_m(self) -> float | None:
+        """Ball-gate clamp just short of the net, or None in open flight."""
+        net = self.tracking_net_m
+        return (net - 0.25) if net else None
+
+    def _club_gate_m(self) -> tuple[float, float] | None:
+        """Range gate around the tee where the club approaches, or None."""
+        from openflight.iwr6843.club import (  # pylint: disable=import-outside-toplevel
+            CLUB_APPROACH_DEPTH_M,
+            CLUB_GATE_TEE_MARGIN_M,
+        )
+
+        tee = self.calibration.tee_range_m
+        if not tee:
+            return None
+        return (max(0.35, tee - CLUB_APPROACH_DEPTH_M), tee + CLUB_GATE_TEE_MARGIN_M)
+
+    def plan_sparse_cells(self, summary: PowerSummary) -> SparsePlan:
+        """Name the range cells LCMF, club path, and the noise floor need.
+
+        Ball-track centers come first, then their neighbors, then club-gate
+        peaks, so a trimmed request drops club context before the ball.
+        """
+        geometry = summary.geometry
+        track = tracking.find_ball_from_power(
+            summary.power,
+            geometry,
+            max_range_m=tracking.track_max_range_m(self.tracking_net_m),
+        )
+        cells = track_cells(track, geometry) if track is not None else []
+        tee = self.calibration.tee_range_m
+        if tee:
+            rows, bins = tracking.detection_peaks(
+                summary.power, geometry, gates_m=(club_gate_m(tee),)
+            )
+            seen = set(cells)
+            peaks = [(int(row) // summary.n_loops, absolute) for row, absolute in zip(rows, bins)]
+            cells.extend(cell for cell in expand_cells(peaks, geometry) if cell not in seen)
+        return SparsePlan(cells=tuple(cells), noise_cells=tuple(noise_cells(summary, cells)))
+
+    def track_config_command(self) -> str:
+        """``trackCfg`` line that gives the firmware tracker this rig's limits.
+
+        Fields, all SI: loop period (s), range bin size (m), ball max range
+        (m), club gate low and high (m). A zero max range disables the net
+        clamp; a zero-width gate disables the club cells. 17 significant
+        digits let the firmware's strtod land on the host's exact doubles.
+        """
+        from openflight.iwr6843.sparse import (  # pylint: disable=import-outside-toplevel
+            RANGE_FFT_SIZE,
+        )
+        from openflight.iwr6843.tracking import (  # pylint: disable=import-outside-toplevel
+            LOOP_PRI_S,
+            RANGE_SPAN_M,
+        )
+
+        max_range = self._ball_max_range_m() or 0.0
+        club_lo, club_hi = self._club_gate_m() or (0.0, 0.0)
+        fields = (
+            self._loop_period_s() or LOOP_PRI_S,
+            RANGE_SPAN_M / RANGE_FFT_SIZE,
+            max_range,
+            club_lo,
+            club_hi,
+        )
+        return "trackCfg " + " ".join(f"{value:.17g}" for value in fields)
+
+    def _loop_period_s(self) -> float | None:
+        """Same-TX loop period of the loaded cfg; None without a capture monitor.
+
+        The host planner times rows from the ILP1 header's transmitter count,
+        so the firmware tracker must get the same physical period.
+        """
+        from openflight.iwr6843.monitor import (  # pylint: disable=import-outside-toplevel
+            read_capture_config,
+        )
+
+        config_path = getattr(self.capture_monitor, "config_path", None)
+        if config_path is None:
+            return None
+        return read_capture_config(config_path).loop_period_s
 
     def process_shot(  # pylint: disable=too-many-arguments
         self,
@@ -264,12 +457,15 @@ class IWR6843Runtime:
         if tilt_deg is not None:
             shot_calibration = replace(self.calibration, tilt_rad=math.radians(tilt_deg))
         prepared = prepare_lcmf_capture(capture.raw)
+        if capture.noise_power is not None:
+            # A sparse cube is mostly zeros; its own median would be ~0.
+            prepared.vertical.set_noise_power(capture.noise_power)
         measurement = estimate_lcmf_v1(
             capture.raw,
             shot_calibration,
             ball_speed_mph=ball_speed_mph,
             club=club,
-            net_range_m=self.net_range_m,
+            net_range_m=self.tracking_net_m,
             tx_order=self.tx_order,
             tdm_sign_policy=self.tdm_sign_policy,
             horizontal_phase_reference_rad=self.horizontal_phase_reference_rad,

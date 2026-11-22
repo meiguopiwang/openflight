@@ -16,10 +16,55 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
+# The shipped reference: a validated starting point measured on one board.
 DEFAULT_CAL_PATH = "config/iwr6843_calibration_reference.json"
+# This machine's own board, once measured (scripts/iwr6843/azimuth_check.py
+# --save saves it here), beside the other per-machine settings.
+BOARD_CAL_PATH = Path.home() / ".config" / "openflight" / "iwr6843_calibration.json"
+
+
+def resolve_calibration_path(
+    override: str | Path | None = None, *, board_path: Path | None = None
+) -> Path:
+    """The calibration a live run uses: ``override`` when given (an explicit
+    --iwr6843-cal / --cal), else this board's measured calibration
+    (``board_path``, BOARD_CAL_PATH by default) when it exists, else the
+    shipped reference."""
+    if override is not None:
+        return Path(override)
+    board_path = BOARD_CAL_PATH if board_path is None else board_path
+    if board_path.is_file():
+        return board_path
+    return Path(DEFAULT_CAL_PATH)
+
+
+# Mount tilt used when no session log or --iwr6843-tilt-deg supplies one;
+# 0 silently zeros VLA. Round number: per-board cal can override.
+DEFAULT_PITCH_DEG = 10.0
+
+
+# Antenna-center to tee slant range when the setup has not measured one.
+# Tape readings for the kiosk and scripts are from the enclosure front; add
+# ARRAY_DEPTH_M (or call antenna_range_m) before converting to a range bin.
+DEFAULT_TEE_RANGE_M = 1.575
+
+# Closest tee the kiosk accepts, tape from the enclosure front. Nearer than
+# this the self-trigger's watch region starts under a metre from the radar,
+# where the golfer's hands and body stand (and a desk test fires it).
+MIN_TEE_RANGE_M = 1.4
+
+# Enclosure face to the antenna array, 30 mm. A tape measured from the face
+# reads this much less than the radar's range, which is measured from the array.
+ARRAY_DEPTH_M = 0.030
+
+
+def antenna_range_m(face_range_m: float) -> float:
+    """Range from the antenna array for a distance measured from the enclosure face."""
+    return face_range_m + ARRAY_DEPTH_M
 
 
 @dataclass

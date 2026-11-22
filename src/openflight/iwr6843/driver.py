@@ -17,15 +17,61 @@ from __future__ import annotations
 import glob
 import logging
 import time
+from typing import Callable
 
 import serial
 
 from openflight.iwr6843.dump import HEADER, MAGIC, parse_header, payload_nbytes
+from openflight.iwr6843.firmware_version import (
+    FirmwareVersion,
+    find_version_line,
+    parse_version_reply,
+)
+from openflight.iwr6843.shot_result import parse_result_reply
+from openflight.iwr6843.sparse import (
+    POWER_MAGIC,
+    SLICE_MAGIC,
+    SPARSE_REQUEST_MAX_BYTES,
+    TRACK_MAGIC,
+    OnboardTrack,
+    PowerSummary,
+    SlicePlanner,
+    SparseCapture,
+    SparsePlan,
+    assemble_capture,
+    assemble_dump,
+    fit_cell_request,
+    format_cell_request,
+    parse_power,
+    parse_track,
+    power_packet_size,
+    slice_packet_size,
+    track_packet_size,
+)
 
 BAUD = 1_041_667
+# Firmware CLI line written when the self-trigger freezes the ring.
+TRIGGER_NOTICE = b"Triggered"
+# The firmware CLI prompt, written after every reply (l3_dump.c cliPrompt).
+CLI_PROMPT = b"l3dump:/>"
+_REPLY_VERDICTS = (b"Done", b"Error", b"not recognized")
+# A reply whose prompt never comes is complete once its bytes stop for this
+# long after the verdict (the firmware writes a reply without pauses).
+_REPLY_QUIET_S = 0.1
+_NOTICE_TAIL_BYTES = len(TRIGGER_NOTICE) - 1
 _PORT_GLOBS = ("/dev/ttyUSB*", "/dev/tty.SLAB_USBtoUART*")
 
 logger = logging.getLogger(__name__)
+
+
+class UnsupportedCommand(RuntimeError):
+    """The firmware CLI does not know the command, so it is an older image."""
+
+
+def _reply_verdict_at(resp: bytes) -> int:
+    """Index just past the first Done/Error/not-recognized word, or -1."""
+    found = [(resp.index(word) + len(word)) for word in _REPLY_VERDICTS if word in resp]
+    return min(found) if found else -1
 
 
 def open_port(port: str, baud: int = BAUD, timeout: float = 0.3) -> serial.Serial:
@@ -41,6 +87,10 @@ def open_port(port: str, baud: int = BAUD, timeout: float = 0.3) -> serial.Seria
 class IWR6843Radar:
     """CLI + dump transport for the custom L3-dump firmware."""
 
+    # A ``Triggered`` notice (or its split head) read by a command, kept for
+    # the listener: the firmware stays frozen until someone releases it.
+    _trigger_pending = b""
+
     def __init__(self, port: str | None = None, baud: int = BAUD):
         if port is None:
             port = self.detect_port(baud)
@@ -48,6 +98,8 @@ class IWR6843Radar:
                 raise RuntimeError("no IWR6843 CLI found — board on, flashed, single-port fw?")
         self.port = port
         self.ser = open_port(port, baud)
+        self._trigger_pending = b""
+        self._last_cli_error = ""
 
     @staticmethod
     def detect_port(baud: int = BAUD) -> str | None:
@@ -73,16 +125,83 @@ class IWR6843Radar:
                 return cand
         return None
 
-    def cmd(self, line: str, window: float = 1.5) -> str:
-        """Send one CLI line; collect the response until Done/Error/timeout."""
+    def wait_trigger_notice(self, pending: bytes = b"") -> tuple[bool, bytes]:
+        """Wait up to the port timeout for CLI bytes; report a ``Triggered`` line.
+
+        ``read`` returns as soon as a byte arrives, so the notice is seen
+        within about a millisecond. ``pending`` carries a partial line
+        between calls; the tail kept is long enough to hold a split word.
+        """
+        pending = self._trigger_pending + pending
+        self._trigger_pending = b""
+        if TRIGGER_NOTICE not in pending:
+            waiting = self.ser.in_waiting
+            pending += self.ser.read(waiting if waiting else 1)
+        if TRIGGER_NOTICE in pending:
+            return True, b""
+        return False, pending[-_NOTICE_TAIL_BYTES:]
+
+    def _remember_trigger_notice(self, data: bytes) -> None:
+        """Keep a notice (or its split head) that a command read off the port."""
+        pending = self._trigger_pending + data
+        if TRIGGER_NOTICE in pending:
+            self._trigger_pending = TRIGGER_NOTICE
+        else:
+            self._trigger_pending = pending[-_NOTICE_TAIL_BYTES:]
+
+    def _discard_before_readback(self) -> None:
+        """Drop stale input before reading the frozen capture out.
+
+        A notice pending here belongs to the capture this readback consumes,
+        so keeping it would fire a phantom capture once the ring rearms.
+        """
         self.ser.reset_input_buffer()
+        self._trigger_pending = b""
+
+    def cmd(self, line: str, window: float = 1.5) -> str:
+        """Send one CLI line; collect the reply through the prompt that ends it.
+
+        The reply is complete at the CLI prompt that follows its Done, Error
+        or "not recognized" line, not at the first of those words: the
+        firmware writes a reply byte by byte, so a read can return
+        ``Error: stop the senso`` and the rest would otherwise arrive as the
+        next command's reply. Without a prompt the window bounds the wait.
+        Stale bytes are dropped rather than taken as the reply, except a
+        ``Triggered`` notice among them, which is kept for the listener.
+        """
+        waiting = self.ser.in_waiting
+        if waiting:
+            self._remember_trigger_notice(self.ser.read(waiting))
         self.ser.write((line + "\n").encode())
         resp = b""
+        verdict_at = -1
+        reply_end = -1
         deadline = time.time() + window
+        last_byte_at = time.time()
         while time.time() < deadline:
-            resp += self.ser.read(512)
-            if b"Done" in resp or b"Error" in resp:
+            # in_waiting-sized reads, else read(1): read(512) would wait out
+            # the port timeout for every reply shorter than 512 bytes.
+            waiting = self.ser.in_waiting
+            chunk = self.ser.read(waiting if waiting else 1)
+            if chunk:
+                resp += chunk
+                last_byte_at = time.time()
+            if verdict_at < 0:
+                verdict_at = _reply_verdict_at(resp)
+            if verdict_at < 0:
+                continue
+            if CLI_PROMPT in resp[verdict_at:]:
+                reply_end = resp.index(CLI_PROMPT, verdict_at) + len(CLI_PROMPT)
                 break
+            if time.time() - last_byte_at >= _REPLY_QUIET_S:
+                break
+        # The whole read is scanned for a notice, split or not; only the reply
+        # is returned. Bytes after the prompt are the start of whatever
+        # streams next (a debug line, a notice), and a partial debug line
+        # handed back here would parse as one with fields missing.
+        self._remember_trigger_notice(resp)
+        if reply_end >= 0:
+            resp = resp[:reply_end]
         return resp.decode(errors="replace")
 
     def drain_stale_output(
@@ -134,27 +253,38 @@ class IWR6843Radar:
                 "the firmware may be wedged (press RESET and retry)"
             )
 
-    def send_config(self, cfg_path: str) -> None:
+    def send_config(self, cfg_path: str, lines: list[str] | None = None) -> None:
         """Stop and flush old state, then stream the cfg; raise on Error.
 
-        The firmware's geometry guard rejects a cfg whose loops/samples don't
-        match the flashed build — that surfaces here as RuntimeError.
+        ``lines`` replaces the file's contents (the monitor's tee-relative
+        windows); ``cfg_path`` is then only named in errors. The firmware's
+        geometry guard rejects a cfg whose loops/samples don't match the
+        flashed build — that surfaces here as RuntimeError.
         """
         self.drain_stale_output()
+        # A crashed watch session can leave debug lines streaming, or the CLI
+        # blocked in l3sparse's cell-request read. This line silences debug
+        # and, if that read is still open, completes it so sensorStop is a
+        # real command.
+        self.cmd("debugCfg 0", 8.0)
         self._require_done("sensorStop", self.cmd("sensorStop", 3.0))
         self._require_done("flushCfg", self.cmd("flushCfg", 1.5))
-        with open(cfg_path, encoding="utf-8") as cfg:
-            for rawline in cfg:
-                line = rawline.strip()
-                if not line or line.startswith("%"):
-                    continue
-                # The driver owns the lifecycle commands so every config gets
-                # the required stop/flush ordering without sending duplicates.
-                if line in {"sensorStop", "flushCfg"}:
-                    continue
-                window = 6.0 if line.startswith("sensorStart") else 1.5
-                resp = self.cmd(line, window)
-                self._require_done(line, resp)
+        self._trigger_pending = b""
+        if lines is None:
+            with open(cfg_path, encoding="utf-8") as cfg:
+                lines = cfg.read().splitlines()
+        for rawline in lines:
+            line = rawline.strip()
+            if not line or line.startswith("%"):
+                continue
+            # The driver owns the lifecycle commands so every config gets
+            # the required stop/flush ordering without sending duplicates.
+            if line in {"sensorStop", "flushCfg", "debugCfg 0"}:
+                continue
+            # sensorStart blocks on RF calibration; 6s loses a cold BSS.
+            window = 12.0 if line.startswith("sensorStart") else 1.5
+            resp = self.cmd(line, window)
+            self._require_done(line, resp)
         deadline = time.monotonic() + 6.0
         health = ""
         while time.monotonic() < deadline:
@@ -172,7 +302,7 @@ class IWR6843Radar:
         Syncs on the ILD1 magic past the CLI echo and sizes the read from the
         dump's own header, so any firmware geometry works.
         """
-        self.ser.reset_input_buffer()
+        self._discard_before_readback()
         self.ser.write(b"l3dump\n")
         buf = bytearray()
         expected: int | None = None
@@ -216,6 +346,182 @@ class IWR6843Radar:
                 )
         return payload
 
+    def read_sparse(self, planner: SlicePlanner, timeout_s: float = 8.0) -> SparseCapture | None:
+        """Freeze, read residual power, then the complex cells ``planner`` names.
+
+        Returns None only when the firmware rejects ``l3sparse`` before it
+        freezes (older firmware, IQ8 storage), so ``l3dump`` is still safe.
+        Any failure after that raises: the firmware has already re-armed, and
+        an ``l3dump`` would return a ring recorded after the shot.
+        """
+        try:
+            exchange = self._sparse_exchange(planner, timeout_s)
+        except UnsupportedCommand:
+            return None
+        if exchange is None:
+            return None
+        summary, plan, requested, slice_packet = exchange
+        return assemble_capture(summary, slice_packet, plan, requested_cells=requested)
+
+    def release_sparse_freeze(self, timeout_s: float = 8.0) -> None:
+        """Rearm a self-triggered freeze.
+
+        ``l3sparse`` reads its cell line only after streaming the power map.
+        The SCI receiver holds one byte, so a line written during that stream
+        is overwritten, and writing it afterwards loses to the 5s firmware
+        wait when the CP2105 stalls. Release asks for no cells, so it is one
+        command.
+        """
+        self._discard_before_readback()
+        reply = self.cmd("l3release", timeout_s)
+        if "not recognized" in reply:
+            raise RuntimeError(
+                "IWR6843 has no l3release; flash the current firmware to clear a self-trigger"
+            )
+        if "Error" in reply or "Done" not in reply:
+            detail = reply.strip() or "no acknowledgement"
+            raise RuntimeError(f"IWR6843 did not release the frozen ring: {detail}")
+
+    def read_tracked(self, timeout_s: float = 8.0) -> tuple[bytes, float, OnboardTrack] | None:
+        """Freeze and read the cells the firmware tracker chose (``l3track``).
+
+        Returns the assembled dump, the noise power and the firmware's track,
+        or None when the firmware refuses before streaming (no trackCfg, IQ8
+        storage), so the caller can fall back to another command.
+        Raises UnsupportedCommand when the firmware has no ``l3track``, and
+        RuntimeError when the stream breaks after it starts: the ring has
+        already been rearmed, so a fallback would capture the wrong window.
+        """
+        self._discard_before_readback()
+        self.ser.write(b"l3track\n")
+        try:
+            read = self._read_packet(TRACK_MAGIC, track_packet_size, timeout_s)
+        except TimeoutError as exc:
+            raise RuntimeError("IWR6843 l3track packet ended early") from exc
+        if read is None:
+            return None
+        packet, rest = read
+        layout, track = parse_track(packet)
+        try:
+            read = self._read_packet(
+                SLICE_MAGIC,
+                lambda header: slice_packet_size(header, layout),
+                timeout_s,
+                pending=rest,
+            )
+        except TimeoutError as exc:
+            raise RuntimeError("IWR6843 l3track cell packet ended early") from exc
+        if read is None:
+            raise RuntimeError("IWR6843 l3track cell packet ended early")
+        slice_packet, rest = read
+        trailer = self._wait_for_dump_cli_ready(rest, timeout_s=1.0)
+        if b"Error" in trailer:
+            raise RuntimeError(
+                "IWR6843 track capture completed but firmware restart failed: "
+                f"{trailer.decode(errors='replace').strip()}"
+            )
+        return assemble_dump(layout, slice_packet), layout.noise_power, track
+
+    def _sparse_exchange(
+        self,
+        planner: SlicePlanner,
+        timeout_s: float,
+    ) -> tuple[PowerSummary, SparsePlan, int, bytes] | None:
+        """Run one l3sparse round trip. None when rejected before the freeze."""
+        self._discard_before_readback()
+        self._last_cli_error = ""
+        self.ser.write(b"l3sparse\n")
+        read = self._read_packet(POWER_MAGIC, power_packet_size, timeout_s)
+        if read is None:
+            return None
+        packet, rest = read
+        summary = parse_power(packet)
+        try:
+            plan = planner(summary)
+        except Exception:
+            # The firmware is frozen and reading its next CLI line as the
+            # cell request. Answer it, or the next command would be eaten.
+            self.ser.write(format_cell_request([]))
+            raise
+        ordered = plan.request_order()
+        request, sent = fit_cell_request(ordered)
+        if sent < len(ordered):
+            logger.warning(
+                "[IWR6843] Sparse request trimmed to %d of %d cells (%d-byte limit)",
+                sent,
+                len(ordered),
+                SPARSE_REQUEST_MAX_BYTES,
+            )
+        self.ser.write(request)
+        read = self._read_packet(
+            SLICE_MAGIC,
+            lambda header: slice_packet_size(header, summary),
+            timeout_s,
+            pending=rest,
+        )
+        if read is None:
+            detail = self._last_cli_error
+            message = "IWR6843 rejected the sparse cell request after freezing"
+            if detail:
+                message = f"{message}: {detail}"
+            raise RuntimeError(message)
+        slice_packet, rest = read
+        trailer = self._wait_for_dump_cli_ready(rest, timeout_s=1.0)
+        if b"Error" in trailer:
+            raise RuntimeError(
+                "IWR6843 sparse capture completed but firmware restart failed: "
+                f"{trailer.decode(errors='replace').strip()}"
+            )
+        return summary, plan, len(ordered), slice_packet
+
+    def _read_packet(
+        self,
+        magic: bytes,
+        packet_size: Callable[[bytes], int],
+        timeout_s: float,
+        pending: bytes = b"",
+    ) -> tuple[bytes, bytes] | None:
+        """Read one ``magic`` packet sized by its own header.
+
+        Returns (packet, bytes after it), or None when the CLI reports an
+        error before the magic. Only bytes before the magic are searched for
+        error text; the binary payload can contain any byte sequence.
+        ``pending`` holds bytes already read that belong to this packet.
+        """
+        header_size = packet_size(b"")
+        buf = bytearray(pending)
+        deadline = time.monotonic() + timeout_s
+        start: int | None = None
+        while time.monotonic() < deadline:
+            if start is None:
+                idx = buf.find(magic)
+                if idx < 0:
+                    text = bytes(buf)
+                    if b"not recognized" in text:
+                        raise UnsupportedCommand(text.decode(errors="replace").strip())
+                    error_at = text.find(b"Error")
+                    if error_at >= 0 and b"\n" in text[error_at:]:
+                        self._last_cli_error = text.decode(errors="replace").strip()
+                        return None
+                else:
+                    start = idx
+            if start is not None:
+                body = bytes(buf[start:])
+                if len(body) >= header_size:
+                    total = packet_size(body)
+                    if len(body) >= total:
+                        return body[:total], body[total:]
+            waiting = self.ser.in_waiting
+            chunk = self.ser.read(waiting if waiting else 1)
+            if chunk:
+                buf.extend(chunk)
+        if start is None and b"Error" in buf:
+            self._last_cli_error = bytes(buf).decode(errors="replace").strip()
+            return None
+        raise TimeoutError(
+            f"IWR6843 {magic.decode()} packet incomplete after {timeout_s:.1f}s ({len(buf)} bytes)"
+        )
+
     def _wait_for_dump_cli_ready(self, initial: bytes, *, timeout_s: float) -> bytes:
         """Consume the dump handler's trailing response before reusing the CLI."""
         response = bytearray(initial)
@@ -227,11 +533,220 @@ class IWR6843Radar:
             chunk = self.ser.read(waiting if waiting else 1)
             if chunk:
                 response.extend(chunk)
+        self._remember_trigger_notice(bytes(response))
         return bytes(response)
 
     def stats(self) -> str:
         """Firmware health line (frames/wraps/active/calib/rf_faults)."""
         return self.cmd("stats", 2.0)
+
+    def trigger_log(self) -> str:
+        """The self-trigger front end's floor and threshold, then its configuration.
+
+        The club track fires the trigger: ``club_track`` reads what it followed
+        and ``trigger_trace`` what the radar was offered.
+        """
+        return self.cmd("triggerLog", 2.0)
+
+    def tee_scan(self, first_bin: int, count: int) -> str:
+        """``ball scan``: static power per global bin averaged over the ring's pre frames.
+
+        The firmware freezes at the next frame boundary, reports, and rearms,
+        so the sensor must be active. Parse with ``tee_scan.parse_tee_scan``.
+        """
+        return self.cmd(f"ball scan {first_bin} {count}", 4.0)
+
+    def dsp_ping(self) -> int:
+        """``trackCfg dsp ping``: the DSS's round trip over the mailbox, in us.
+
+        Raises ``DspLinkError`` when it does not answer or the image has no link.
+        """
+        from .dsp_link import parse_dsp_pong  # pylint: disable=import-outside-toplevel
+
+        return parse_dsp_pong(self.cmd("trackCfg dsp ping", 2.0))
+
+    def dsp_status(self):
+        """``trackCfg dsp status``: the boot stage the DSS reached (``dsp_link.DspStatus``)."""
+        from .dsp_link import parse_dsp_status  # pylint: disable=import-outside-toplevel
+
+        return parse_dsp_status(self.cmd("trackCfg dsp status", 2.0))
+
+    def dsp_hw(self):
+        """``trackCfg dsp hw``: the DSS's halt, power, ESM and mirrored stage
+        as the MSS reads them (``dsp_link.DspHw``)."""
+        from .dsp_link import parse_dsp_hw  # pylint: disable=import-outside-toplevel
+
+        return parse_dsp_hw(self.cmd("trackCfg dsp hw", 2.0))
+
+    def dsp_probe(self, bins: int | None = None):
+        """``trackCfg dsp probe [bins]``: the newest ring frame scored on the MSS
+        and the DSS, timed and compared (``dsp_link.DspProbe``). Needs a
+        running IQ16 capture; ``bins`` scores only the first ones."""
+        from .dsp_link import parse_dsp_probe  # pylint: disable=import-outside-toplevel
+
+        if bins is not None and bins < 1:
+            raise ValueError(f"bins must be >= 1, got {bins}")
+        line = "trackCfg dsp probe" if bins is None else f"trackCfg dsp probe {bins}"
+        return parse_dsp_probe(self.cmd(line, 2.0))
+
+    def detect_core(self, core: str | None = None):
+        """``trackCfg detectCore [dss|verify]``: how the detector's bins are
+        scored (``dsp_link.DetectCoreStatus``). With ``core``, choose it
+        first: that clears a latch and starts the counts and the detect
+        timing over. verify needs an IQ16 ring and the DSS link; a refusal
+        raises ``DspLinkError``."""
+        from .dsp_link import (  # pylint: disable=import-outside-toplevel
+            DETECT_CORES,
+            parse_detect_core,
+        )
+
+        if core is not None and core not in DETECT_CORES:
+            raise ValueError(f"core must be one of {DETECT_CORES}, got {core!r}")
+        line = "trackCfg detectCore" if core is None else f"trackCfg detectCore {core}"
+        return parse_detect_core(self.cmd(line, 2.0))
+
+    def detect_timing(self):
+        """``triggerLog timing``: the detect core, the detect timing and the
+        last frames' timelines (``dsp_link.DetectTiming``, None before any
+        frame was decided)."""
+        from .dsp_link import parse_detect_timing  # pylint: disable=import-outside-toplevel
+
+        return parse_detect_timing(self.cmd("triggerLog timing", 2.0))
+
+    def ball_status(self) -> str:
+        """The ball-placement detector's state line; parse with ``tee_scan.parse_ball_status``."""
+        return self.cmd("ball status", 2.0)
+
+    def configure_ball(self, enable: bool, follow: bool) -> None:
+        """Start (or stop) the ball-placement detector; ``follow`` aims the trigger at it."""
+        self._require_done(
+            "ball cfg", self.cmd(f"ball cfg {int(enable)} {int(follow and enable)}", 2.0)
+        )
+
+    def set_tee_band(self, bins: float) -> bool:
+        """Set the tee band's width in range bins (0: no band).
+
+        The club and ball trackers ignore targets inside the band, which the
+        firmware places on the noisiest idle bins near the ball, and the impact is fitted from the tracks either side of it. A
+        ``trackCfg`` sub-mode because the firmware's CLI table is full; the
+        firmware keeps it across ``triggerCfg`` and ``sensorStart``.
+
+        Returns True when the board acknowledged it. Clearing the band (0) on
+        firmware that predates it (an ``Error`` or ``not recognized`` reply)
+        returns False: there is no band to clear. Any other refusal, and a
+        board that does not answer at all, raises RuntimeError.
+        """
+        return self._set_track_cfg_sub_mode(f"trackCfg impactFit {bins:g}", refusal_ok=bins == 0.0)
+
+    def set_ball_snr(self, snr: float) -> bool:
+        """Set the ball tracker's extraction snr apart from the trigger's (0: firmware default).
+
+        A ``trackCfg`` sub-mode the firmware keeps across ``triggerCfg`` and
+        ``sensorStart``, like the tee band. Returns True when acknowledged;
+        asking firmware that predates it for its default (0) returns False,
+        since it uses that default anyway. Any other refusal, and silence,
+        raises RuntimeError.
+        """
+        return self._set_track_cfg_sub_mode(f"trackCfg ballSnr {snr:g}", refusal_ok=snr == 0.0)
+
+    def set_radar_cal(self, args: tuple[float, ...]) -> bool:
+        """``trackCfg cal``: the attitude and baseline zeros (``BoardCalibration.cal_args``).
+
+        Kept by the firmware across ``triggerCfg`` and ``sensorStart``; the next
+        ``triggerCfg`` copies it into the track configs. False when firmware
+        without it refuses it (``Error`` or ``not recognized``), for any values;
+        silence raises.
+        """
+        text = " ".join(f"{value:g}" for value in args)
+        return self._set_track_cfg_sub_mode(f"trackCfg cal {text}", refusal_ok=True)
+
+    def set_elements(self, phases, gains) -> bool:
+        """``trackCfg elem i phase gain`` for every element, physical order.
+
+        False when firmware without it refuses any of them; silence raises.
+        """
+        applied = True
+        for index, (phase, gain) in enumerate(zip(phases, gains)):
+            applied = (
+                self._set_track_cfg_sub_mode(
+                    f"trackCfg elem {index} {phase:g} {gain:g}", refusal_ok=True
+                )
+                and applied
+            )
+        return applied
+
+    def _set_track_cfg_sub_mode(self, command: str, *, refusal_ok: bool) -> bool:
+        """Send a persistent ``trackCfg`` sub-mode; old firmware may refuse it.
+
+        With ``refusal_ok``, a refusal (``Error`` or ``not recognized``) is
+        firmware without the sub-mode: False. Anything else must answer ``Done``.
+        """
+        reply = self.cmd(command, 2.0)
+        if refusal_ok and "Done" not in reply and ("Error" in reply or "not recognized" in reply):
+            return False
+        self._require_done(command, reply)
+        return True
+
+    def trigger_trace(self) -> str:
+        """The detector's raw-input trace: what it was offered, not what it took.
+
+        A header, the per-bin maximum of the detection statistic since arming
+        (``bin:max@frame``), then one line per frame whose strongest bin
+        reached twice the floor, with all-loop energy, strongest-loop peak,
+        loop-0 power and the floor. Read it after a missed swing: an empty
+        trace with flat maxima means the club was not seen at all; entries
+        under ``floor x snr`` mean it was seen and thresholded out.
+        """
+        return self.cmd("triggerLog trace", 6.0)
+
+    def clear_trigger_trace(self) -> None:
+        """Empty the trace and its maxima; the arm and the log are untouched."""
+        self._require_done("triggerLog clear", self.cmd("triggerLog clear", 2.0))
+
+    def club_track(self) -> str:
+        """``triggerLog track``: the club track, its delivery fit, the newest
+        angle estimate, the range impact verdict that fires the self-trigger,
+        the impact fit and every held point."""
+        return self.cmd("triggerLog track", 3.0)
+
+    def shot_status(self) -> str:
+        """``triggerLog shot``: the shot machine, the ball track, the launch and
+        the ball points."""
+        return self.cmd("triggerLog shot", 3.0)
+
+    def shot_result(self):
+        """The firmware's result packet for the last shot, parsed, or None when
+        the machine has not reached RESULT since the last rearm.
+
+        Reads ``triggerLog result``; the packet lines are always printed (the
+        last shot's, or all invalid), so ``ready=0`` on the first line is what
+        says there is no result yet.
+        """
+        reply = self.cmd("triggerLog result", 3.0)
+        if " ready=1" not in reply:
+            return None
+        return parse_result_reply(reply)
+
+    def perf(self) -> str:
+        """``triggerLog perf``: per-stage microseconds and the adaptive window state."""
+        return self.cmd("triggerLog perf", 2.0)
+
+    def firmware_version(self) -> FirmwareVersion | None:
+        """Identity of the flashed image (``stats version``), or None when it predates it.
+
+        An image without the sub-mode ignores the argument and answers with
+        its counters, so a completed reply with no ``version=`` line means an
+        unversioned image. Raises RuntimeError when the command fails or the
+        version line is malformed.
+        """
+        reply = self.cmd("stats version", 2.0)
+        self._require_done("stats version", reply)
+        if find_version_line(reply) is None:
+            return None
+        try:
+            return parse_version_reply(reply)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def stop_sensor(self) -> None:
         """Stop capture and verify the firmware returned to its idle CLI state."""

@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from openflight.iwr6843 import Calibration
+from openflight.iwr6843.calibration import resolve_calibration_path
 from openflight.iwr6843.calibration_session import (
     CalibrationSummary,
     JsonlWriter,
@@ -19,7 +20,11 @@ from openflight.iwr6843.calibration_session import (
     parse_club,
     tilt_consistency_sweep,
 )
-from openflight.iwr6843.monitor import IWR6843CaptureMonitor, tx_order_from_config
+from openflight.iwr6843.monitor import (
+    DEFAULT_IWR6843_CONFIG,
+    IWR6843CaptureMonitor,
+    tx_order_from_config,
+)
 from openflight.iwr6843.runtime import IWR6843Runtime
 from openflight.iwr6843.shot import process_dump
 from openflight.rolling_buffer.monitor import RollingBufferMonitor
@@ -45,13 +50,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trigger-pin", type=int, default=17, help="BCM GPIO for sound trigger")
     parser.add_argument(
         "--cfg",
-        default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg",
+        default=DEFAULT_IWR6843_CONFIG,
         help="IWR6843 L3 dump cfg file",
     )
     parser.add_argument(
         "--cal",
-        default="config/iwr6843_calibration_reference.json",
-        help="IWR6843 array calibration JSON",
+        default=None,
+        help="IWR6843 array calibration JSON (default: this board's, "
+        "~/.config/openflight/iwr6843_calibration.json, when measured; else the reference)",
     )
     parser.add_argument("--outdir", type=Path, default=None, help="Directory for dumps/logs")
     parser.add_argument("--tee-m", type=float, required=True, help="Radar-to-ball slant range")
@@ -145,7 +151,7 @@ def main() -> int:
     club = parse_club(args.club)
 
     calibration = clone_calibration(
-        Calibration.load(args.cal),
+        Calibration.load(str(resolve_calibration_path(args.cal))),
         tee_range_m=args.tee_m,
         tilt_deg=args.tilt_deg,
         radar_height_m=args.radar_height_m,
@@ -162,7 +168,7 @@ def main() -> int:
             "shots_requested": args.shots,
             "club": club.value,
             "cfg": args.cfg,
-            "cal": args.cal,
+            "cal": str(resolve_calibration_path(args.cal)),
             "tee_m": args.tee_m,
             "net_m": args.net_m,
             "tilt_deg": center_tilt_deg,

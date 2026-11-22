@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
@@ -42,6 +42,7 @@ from .clubs.physics import (
     get_club_physics,
     get_club_simulation_profile,
 )
+from .environment import STANDARD_ENVIRONMENT, Environment
 from .inclinometer.calibration import (
     InclinometerCalibrationError,
     LevelCalibration,
@@ -85,6 +86,9 @@ from .speed_correction import correct_ball_speed
 from .spin_estimate import calculated_spin_rpm
 from .startup_status import StartupStatusReporter, configured_startup_components
 from .swing_speed import SwingSpeedEvent
+
+if TYPE_CHECKING:
+    from .iwr6843.monitor import SelfTriggerConfig
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -157,6 +161,9 @@ kld7_horizontal = None
 # TI IWR6843 L3 rolling-buffer capture + LCMF-v1 launch angle.
 iwr6843_runtime = None
 iwr6843_runtime_config: dict = {"enabled": False}
+# Polls the firmware's ball-placement detector for the kiosk's setup banner
+# (the iwr_setup event). None unless the detector is on.
+iwr6843_setup_poller = None
 camera_capture_runtime = None
 camera_capture_config: dict = {"enabled": False}
 camera_replay_manager = None
@@ -190,6 +197,9 @@ class InclinometerOffsets(NamedTuple):
 # a vertical launch angle is available. Operators can explicitly disable it;
 # missing launch inputs always fall back to the legacy table estimator.
 ballistics_enabled: bool = True
+# The day's air for the flight model: temperature, pressure, humidity or
+# altitude from the CLI (later the environmental sensors). Standard by default.
+flight_environment: Environment = STANDARD_ENVIRONMENT
 
 # Simulator connectors (optional). Populated in main() from config/sim.json +
 # CLI flags; shots fan out to every connected connector. Player/club state is
@@ -485,6 +495,7 @@ def _cleanup_hardware_for_shutdown() -> bool:
     if inclinometer_service:
         _run_shutdown_step("inclinometer stop", inclinometer_service.stop)
     if iwr6843_runtime:
+        _run_shutdown_step("IWR6843 setup poll stop", _stop_iwr6843_setup_poller)
         _run_shutdown_step("IWR6843 stop", iwr6843_runtime.stop)
     if power_monitor:
         _run_shutdown_step("battery monitor stop", power_monitor.stop)
@@ -1400,6 +1411,103 @@ def init_camera_capture(
         return False
 
 
+# The self-trigger defaults live with SelfTriggerConfig in iwr6843.monitor so
+# the hardware check suite and the watch script arm the same way.
+# OPS rolling-buffer split (S#n of 32 segments, ~4.27 ms each at 30 ksps).
+# The self-trigger reaches the OPS as S! a few ms to tens of ms after impact,
+# so keep more of the buffer before the request than the sound gate needs.
+_DEFAULT_OPS_PRE_TRIGGER_SEGMENTS = 16
+_SELF_TRIGGER_OPS_PRE_TRIGGER_SEGMENTS = 24
+_OPS_BUFFER_SEGMENTS = 32
+_OPS_BUFFER_SAMPLES = 4096
+
+
+def _iwr6843_tee_range_m(args) -> float:
+    """Antenna-to-tee range: the tape reading from the enclosure face plus the
+    array's depth behind it. The firmware, the capture windows and the shot
+    geometry all work in range from the antenna."""
+    from .iwr6843.calibration import antenna_range_m  # pylint: disable=import-outside-toplevel
+
+    return antenna_range_m(args.iwr6843_tee_m)
+
+
+def _iwr6843_calibration_path(args) -> str:
+    """--iwr6843-cal when given, else this board's measured calibration
+    (~/.config/openflight/iwr6843_calibration.json) when it exists, else the
+    shipped reference."""
+    from .iwr6843.calibration import (  # pylint: disable=import-outside-toplevel
+        resolve_calibration_path,
+    )
+
+    return str(resolve_calibration_path(args.iwr6843_cal))
+
+
+def _self_trigger_config(args) -> "SelfTriggerConfig | None":
+    """--iwr6843-self-trigger turns the firmware trigger on; the rest only tunes it.
+
+    Raises ValueError for tuning flags without the switch, so a partial
+    command line cannot silently change which trigger drives the shot.
+    """
+    from .iwr6843.monitor import (
+        SELF_TRIGGER_DEFAULT_OFFSET_M,
+        SELF_TRIGGER_DEFAULT_SNR,
+        SelfTriggerConfig,
+        check_first_window_bin,
+        self_trigger_bin,
+    )
+
+    tuning = [
+        flag
+        for flag, value in (
+            ("--iwr6843-self-trigger-bin", args.iwr6843_self_trigger_bin),
+            ("--iwr6843-self-trigger-snr", args.iwr6843_self_trigger_snr),
+            ("--iwr6843-self-trigger-offset-m", args.iwr6843_self_trigger_offset_m),
+        )
+        if value is not None
+    ]
+    if not args.iwr6843_self_trigger:
+        if tuning:
+            raise ValueError(f"{', '.join(tuning)} requires --iwr6843-self-trigger")
+        return None
+    offset_m = args.iwr6843_self_trigger_offset_m
+    bin_index = args.iwr6843_self_trigger_bin
+    if bin_index is None:
+        bin_index = self_trigger_bin(
+            args.iwr6843_tee_m,
+            args.iwr6843_config,
+            offset_m=SELF_TRIGGER_DEFAULT_OFFSET_M if offset_m is None else offset_m,
+        )
+    elif offset_m is not None:
+        raise ValueError(
+            "--iwr6843-self-trigger-offset-m moves the default bin; "
+            "it cannot be combined with --iwr6843-self-trigger-bin"
+        )
+    else:
+        check_first_window_bin(bin_index, args.iwr6843_config, f"self-trigger bin {bin_index}")
+    snr = args.iwr6843_self_trigger_snr
+    return SelfTriggerConfig(
+        tee_bin=bin_index,
+        snr=SELF_TRIGGER_DEFAULT_SNR if snr is None else snr,
+    )
+
+
+def _ops_pre_trigger_segments(args) -> int:
+    """Explicit --sound-pre-trigger wins; otherwise the trigger source decides."""
+    if args.sound_pre_trigger is not None:
+        return args.sound_pre_trigger
+    if args.iwr6843_self_trigger:
+        return _SELF_TRIGGER_OPS_PRE_TRIGGER_SEGMENTS
+    return _DEFAULT_OPS_PRE_TRIGGER_SEGMENTS
+
+
+def _ops_trigger_kwargs(args) -> dict:
+    """The OPS trigger's settings: its pre-trigger, and what fires it (for its logs)."""
+    return {
+        "pre_trigger_segments": _ops_pre_trigger_segments(args),
+        "source": "iwr6843" if args.iwr6843_self_trigger else "sound",
+    }
+
+
 def _resolve_iwr_mount_tilt(
     calibration_tilt_deg: float,
     *,
@@ -1437,16 +1545,74 @@ def init_iwr6843(
     ball_height_m: float = 0.04,
     azimuth_offset_deg: float = 0.0,
     horizontal_phase_reference_rad: float | None = None,
-    save_dumps: bool = False,
+    debug: bool = False,
+    self_trigger: "SelfTriggerConfig | None" = None,
+    flight: str = "net",
+    onboard_track: bool = True,
+    full_capture: bool = False,
+    ball_detector: str = "off",
+    setup_poll_s: float = 1.0,
+    tee_band_bins: float | None = None,
+    ball_snr: float | None = None,
+    veto_no_ball: bool = False,
 ) -> bool:
-    """Initialize GPIO-triggered TI capture and the frozen LCMF-v1 estimator."""
+    """Initialize GPIO-triggered TI capture and the frozen LCMF-v1 estimator.
+
+    ``full_capture`` transfers every stored sample instead of selected cells:
+    a diagnostic mode, about 7 s per shot on the default profile.
+    ``ball_detector`` is off, on or follow: on starts the firmware's placement
+    detector (the shot machine locks the ball and the kiosk gets a setup
+    banner from a ``ball status`` poll every ``setup_poll_s``); follow also
+    aims the self-trigger at the locked ball. ``tee_band_bins`` is the width
+    in range bins of the band near the ball that the firmware's club and ball
+    trackers ignore; the firmware places it on the noisiest idle bins near the
+    tee and freezes it while the club swings; None is the default width, 0
+    turns it off. ``ball_snr`` is the ball tracker's threshold apart from the
+    trigger's; None keeps the firmware's. ``debug`` reads the frozen ring back
+    after every shot as a full capture, saves it and runs the host pipeline
+    beside the board's result; without it the board's result is the shot's
+    only IWR data.
+    """
     global iwr6843_runtime, iwr6843_runtime_config  # pylint: disable=global-statement
+    if full_capture and not debug:
+        raise ValueError("full_capture needs debug: without it the ring is not read back")
+    full_capture = debug
+    from .iwr6843.setup_poll import BALL_DETECTOR_MODES  # pylint: disable=import-outside-toplevel
+
+    if ball_detector not in BALL_DETECTOR_MODES:
+        raise ValueError(f"--iwr6843-ball-detector must be one of {BALL_DETECTOR_MODES}")
+    # ``tee_range_m`` and ``net_range_m`` are tape readings from the enclosure
+    # front. The calibration (shot geometry, club gate), the monitor (capture
+    # windows, trigger) and the runtime (ball-track clamp at the net) work in
+    # range from the array, which sits behind the front; the session log keeps
+    # the tape readings so older logs mean the same thing.
+    from .iwr6843.calibration import (  # pylint: disable=import-outside-toplevel
+        ARRAY_DEPTH_M,
+        antenna_range_m,
+    )
+
+    tee_from_front_m = tee_range_m
+    tee_range_m = antenna_range_m(tee_from_front_m)
+    net_from_front_m = net_range_m
+    net_range_m = None if net_from_front_m is None else antenna_range_m(net_from_front_m)
     try:
         from .iwr6843 import Calibration
-        from .iwr6843.monitor import IWR6843CaptureMonitor, tx_order_from_config
+        from .iwr6843.board_calibration import BoardCalibration
+        from .iwr6843.monitor import (
+            TEE_BAND_DEFAULT_BINS,
+            IWR6843CaptureMonitor,
+            read_capture_config,
+            tx_order_from_config,
+        )
         from .iwr6843.runtime import IWR6843Runtime
 
+        if tee_band_bins is None:
+            tee_band_bins = TEE_BAND_DEFAULT_BINS
         configured_order = tx_order_from_config(config_path)
+        try:
+            capture_format = read_capture_config(config_path).capture_format or "iq16"
+        except OSError:
+            capture_format = None  # recorded for the session log only
         resolved_order = configured_order if tx_order == "auto" else tx_order
         if resolved_order != configured_order:
             raise ValueError(
@@ -1455,6 +1621,7 @@ def init_iwr6843(
             )
 
         calibration = Calibration.load(calibration_path)
+        logger.info("[IWR6843] Calibration: %s", calibration_path)
         calibration.tee_range_m = tee_range_m
         calibration.tee_ball_height_m = ball_height_m
         resolved_tilt_deg, tilt_source, phone_calibration = _resolve_iwr_mount_tilt(
@@ -1467,25 +1634,37 @@ def init_iwr6843(
         if radar_height_m is not None:
             calibration.meta["radar_height_m"] = radar_height_m
 
+        board_calibration = BoardCalibration.from_calibration(calibration)
         capture_monitor = IWR6843CaptureMonitor(
             config_path=config_path,
             output_dir=output_dir,
             port=port,
             gpio_pin=trigger_pin,
-            save_dumps=save_dumps,
+            readback=debug,
+            save_dumps=debug,
+            full_capture=full_capture,
             trigger_observers=(
                 [camera_capture_runtime.notify_trigger]
                 if camera_capture_runtime is not None
                 else None
             ),
+            self_trigger=self_trigger,
+            tee_range_m=tee_range_m,
+            tee_band_bins=tee_band_bins,
+            ball_snr=ball_snr,
+            board_calibration=board_calibration,
+            veto_no_ball=veto_no_ball,
         )
-        # OPS initialization can pulse the shared sound gate. Configure TI now,
-        # but do not accept edges until the OPS trigger path is fully running.
-        capture_monitor.start(armed=False)
+        if self_trigger is not None:
+            logger.warning(
+                "[IWR6843] Self-trigger drives the OPS with S!. Disconnect the "
+                "SEN-14262 GATE from OPS HOST_INT, or both will trigger it."
+            )
         iwr6843_runtime = IWR6843Runtime(
             capture_monitor=capture_monitor,
             calibration=calibration,
             net_range_m=net_range_m,
+            flight_mode=flight,
             tx_order=resolved_order,
             capture_timeout_s=capture_timeout_s,
             azimuth_offset_deg=azimuth_offset_deg,
@@ -1495,6 +1674,21 @@ def init_iwr6843(
             # in multipath and collapse the eight-element vertical channel.
             tdm_sign_policy="positive",
         )
+        capture_monitor.slice_planner = None if full_capture else iwr6843_runtime.plan_sparse_cells
+        # OPS initialization can pulse the shared sound gate. Configure TI now,
+        # but do not accept edges until the OPS trigger path is fully running.
+        # trackCfg goes with the configuration: once the worker starts, only
+        # it may talk to the radar.
+        capture_monitor.start(
+            armed=False,
+            onboard_track_config=(
+                # Full capture or not: the tracker's limits feed the onboard result.
+                iwr6843_runtime.track_config_command() if onboard_track else None
+            ),
+        )
+        onboard_tracking = capture_monitor.onboard_tracking
+        if ball_detector != "off":
+            _start_iwr6843_ball_detector(capture_monitor, ball_detector, setup_poll_s)
         iwr6843_runtime_config = {
             "enabled": True,
             "estimator": "lcmf_v1",
@@ -1502,8 +1696,19 @@ def init_iwr6843(
             "config": str(config_path),
             "calibration": str(calibration_path),
             "trigger_pin_bcm": trigger_pin,
-            "tee_slant_range_m": tee_range_m,
-            "net_range_m": net_range_m,
+            "tee_slant_range_m": tee_from_front_m,
+            "array_depth_m": ARRAY_DEPTH_M,
+            "tee_band_bins": tee_band_bins,
+            "ball_snr": ball_snr,
+            "veto_no_ball": veto_no_ball,
+            "board_calibration": board_calibration.to_dict(),
+            "net_range_m": net_from_front_m,
+            "flight": flight,
+            "self_trigger": (
+                capture_monitor.self_trigger.command
+                if capture_monitor.self_trigger is not None
+                else None
+            ),
             "tx_order": resolved_order,
             "tdm_sign_policy": iwr6843_runtime.tdm_sign_policy,
             "tilt_deg": math.degrees(calibration.tilt_rad),
@@ -1513,8 +1718,13 @@ def init_iwr6843(
             "azimuth_offset_deg": azimuth_offset_deg,
             "horizontal_phase_reference_rad": horizontal_phase_reference_rad,
             "capture_timeout_s": capture_timeout_s,
+            "onboard_tracking": onboard_tracking,
+            "full_capture": full_capture,
+            "ball_detector": ball_detector,
+            "capture_format": capture_format,
             "freeze_delay_ms": 0.0,
-            "raw_dump_saved": save_dumps,
+            "readback": debug,
+            "raw_dump_saved": debug,
             "output_dir": str(Path(output_dir).expanduser()),
         }
         if phone_calibration is not None:
@@ -1537,6 +1747,58 @@ def init_iwr6843(
         iwr6843_runtime = None
         iwr6843_runtime_config = {"enabled": False, "error": str(error)}
         return False
+
+
+def _start_iwr6843_ball_detector(capture_monitor, mode: str, setup_poll_s: float) -> None:
+    """Turn the firmware's placement detector on and start the setup poll.
+
+    ``ball cfg`` goes through the worker's job queue, as every command after
+    start must. A firmware without the detector fails the job, not startup:
+    the poll is then never started and the kiosk sees the detector as off.
+    """
+    global iwr6843_setup_poller  # pylint: disable=global-statement
+    from .iwr6843.setup_poll import (  # pylint: disable=import-outside-toplevel
+        SetupPoller,
+        setup_payload,
+    )
+
+    poller = SetupPoller(
+        capture_monitor.submit,
+        lambda payload: socketio.emit("iwr_setup", payload),
+        interval_s=setup_poll_s,
+    )
+
+    def enable(radar) -> None:
+        try:
+            radar.configure_ball(True, mode == "follow")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("[IWR6843] Ball detector not enabled (%s): no setup banner", exc)
+            socketio.emit("iwr_setup", setup_payload(None, error=str(exc), enabled=False))
+            return
+        logger.info("[IWR6843] Ball detector on (%s); setup poll every %.1fs", mode, setup_poll_s)
+        poller.start()
+
+    iwr6843_setup_poller = poller
+    capture_monitor.submit("ball-cfg", enable)
+    # A restart that rearms the board (a failed capture left it stopped) runs
+    # sensorStart again, which drops ball cfg: send it again.
+    capture_monitor.add_restart_hook(enable)
+
+
+def _stop_iwr6843_setup_poller() -> None:
+    global iwr6843_setup_poller  # pylint: disable=global-statement
+    if iwr6843_setup_poller is not None:
+        iwr6843_setup_poller.stop()
+        iwr6843_setup_poller = None
+
+
+def _iwr6843_setup_status() -> dict:
+    """What a connecting client should show: the last poll, or the detector off."""
+    from .iwr6843.setup_poll import setup_payload  # pylint: disable=import-outside-toplevel
+
+    if iwr6843_setup_poller is not None and iwr6843_setup_poller.latest is not None:
+        return iwr6843_setup_poller.latest
+    return setup_payload(None, enabled=iwr6843_setup_poller is not None)
 
 
 def _iwr6843_startup_recovery(error: object) -> str:
@@ -2482,6 +2744,12 @@ def handle_get_trigger_status():
     socketio.emit("trigger_status", _get_trigger_status())
 
 
+@socketio.on("get_iwr_setup")
+def handle_get_iwr_setup():
+    """Send the latest TI setup guidance (ball range and placement advice)."""
+    socketio.emit("iwr_setup", _iwr6843_setup_status())
+
+
 @socketio.on("set_club")
 def handle_set_club(data):
     """Handle club selection change."""
@@ -3097,11 +3365,16 @@ def vertical_confidence(measurement) -> float:
     return round(ANGLE_CONFIDENCE_FLOOR + span * score, 3)
 
 
+def capped_angle_confidence(confidence: float | None) -> float:
+    """A 0..1 angle confidence held under ANGLE_CONFIDENCE_CEILING; None reads 0."""
+    if confidence is None:
+        return 0.0
+    return round(min(ANGLE_CONFIDENCE_CEILING, max(0.0, float(confidence))), 3)
+
+
 def horizontal_confidence_from(coherence: float | None) -> float:
     """Horizontal launch confidence from HLCMF-v0 coherence."""
-    if coherence is None:
-        return 0.0
-    return round(min(ANGLE_CONFIDENCE_CEILING, max(0.0, float(coherence))), 3)
+    return capped_angle_confidence(coherence)
 
 
 def _iwr_tilt_for_pitch(calibrated_pitch_deg: float | None) -> tuple[float | None, float | None]:
@@ -3147,8 +3420,387 @@ def _snapshot_inclinometer_for_shot(shot: Shot) -> None:
     shot.inclinometer = data
 
 
+def _check_self_trigger_latency(shot: Shot, capture) -> None:
+    """Warn when the self-trigger S! lands after the OPS pre-trigger window.
+
+    In self-trigger mode the capture's trigger time is when the host read
+    the firmware notice and sent S!, so impact -> S! is the OPS budget used.
+    """
+    if (
+        iwr6843_runtime is None
+        or not iwr6843_runtime.self_trigger_enabled
+        or capture is None
+        or shot.impact_timestamp is None
+    ):
+        return
+    segments = getattr(getattr(monitor, "trigger", None), "pre_trigger_segments", None)
+    sample_rate_ksps = getattr(monitor, "sample_rate_ksps", None)
+    latency_ms = (capture.trigger_timestamp - shot.impact_timestamp) * 1000.0
+    if segments is None or not sample_rate_ksps:
+        logger.info("[SERVER] Self-trigger impact -> S!: %.1f ms", latency_ms)
+        return
+    buffer_ms = _OPS_BUFFER_SAMPLES / sample_rate_ksps
+    budget_ms = segments / _OPS_BUFFER_SEGMENTS * buffer_ms
+    log = logger.warning if latency_ms > budget_ms else logger.info
+    log(
+        "[SERVER] Self-trigger impact -> S!: %.1f ms (OPS pre-trigger %.1f ms)",
+        latency_ms,
+        budget_ms,
+    )
+
+
+def _plan_late_window(shot: Shot):
+    """Late looks for this shot, or None outside open flight."""
+    if iwr6843_runtime is None or shot.mode == "mock" or shot.impact_timestamp is None:
+        return None
+    return iwr6843_runtime.plan_late_window(
+        ball_speed_mph=shot.ball_speed_mph,
+        launch_angle_deg=shot.launch_angle_vertical,
+        spin_rpm=shot.spin_rpm,
+    )
+
+
+def _start_late_window(shot: Shot, plan) -> None:
+    """Queue the late looks after the shot is published; update it when done."""
+
+    def on_measured(measured: dict | None) -> None:
+        _apply_late_window_result(shot, measured)
+
+    queued = iwr6843_runtime.measure_late_window(
+        plan,
+        impact_timestamp=shot.impact_timestamp,
+        on_measured=on_measured,
+    )
+    if not queued:
+        _apply_late_window_result(shot, None)
+
+
+def _apply_late_window_result(shot: Shot, measured: dict | None) -> None:
+    """Record the late looks and publish the measured descent, if any."""
+    record = dict(shot.late_window or {})
+    record["measured"] = measured
+    descent = measured.get("descent_deg") if measured is not None else None
+    record["status"] = "measured" if descent is not None else "missed"
+    shot.late_window = record
+    if descent is not None:
+        shot.descent_angle_deg = descent
+        shot.landing_angle_deg = descent
+        shot.landing_angle_source = "late_window_model_assisted"
+    logger.info(
+        "[SERVER] Late window %s for shot #%s%s",
+        record["status"],
+        shot.shot_number,
+        f": descent {descent:.1f} deg" if descent is not None else "",
+    )
+    try:
+        session_log = get_session_logger()
+        if session_log:
+            session_log.log_late_window(
+                shot_number=_shot_number_for_log(shot, session_log),
+                record=record,
+            )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Failed to log late window: %s", error, exc_info=True)
+    try:
+        socketio.emit(
+            "shot_update",
+            {
+                "shot": shot_to_dict(shot),
+                "stats": monitor.get_session_stats() if monitor else {},
+                "pending": {},
+            },
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Failed to emit late-window update: %s", error, exc_info=True)
+
+
+MPS_TO_MPH = 2.23694
+
+# (metric, row label, onboard->display scale, unit, decimals). Speeds are m/s
+# on the wire; angles are already degrees; spin_rate is shown as the firmware
+# sends it (no unit is defined for it yet).
+_ONBOARD_ROWS = (
+    ("ball_speed", "ball speed", MPS_TO_MPH, " mph", 1),
+    ("club_speed", "club speed", MPS_TO_MPH, " mph", 1),
+    ("vertical_launch", "launch V", 1.0, "°", 1),
+    ("horizontal_launch", "launch H", 1.0, "°", 1),
+    ("club_path", "club path", 1.0, "°", 1),
+    ("angle_of_attack", "attack", 1.0, "°", 1),
+    ("spin_rate", "spin rate", 1.0, "", 0),
+    ("spin_axis", "spin axis", 1.0, "°", 1),
+    ("impact_range", "impact range", 1.0, " m", 2),
+)
+
+
+def _fmt(value: float | None, unit: str, decimals: int) -> str:
+    return "-" if value is None else f"{value:.{decimals}f}{unit}"
+
+
+def _onboard_comparators(shot: Shot, measurement, club_path) -> dict[str, tuple[str, float | None]]:
+    """The OPS or host value each onboard metric is judged against, by metric name."""
+    host_path = getattr(club_path, "path_deg", None) if club_path is not None else None
+    path_source = "host"
+    if host_path is None and club_path is not None:
+        host_path = getattr(club_path, "candidate_path_deg", None)
+        path_source = "host cand"
+    return {
+        "ball_speed": ("OPS", shot.ball_speed_mph),
+        "club_speed": ("OPS", shot.club_speed_mph),
+        "vertical_launch": (
+            "host",
+            getattr(measurement, "angle_deg", None) if measurement is not None else None,
+        ),
+        "horizontal_launch": (
+            "host",
+            getattr(measurement, "horizontal_deg", None) if measurement is not None else None,
+        ),
+        "club_path": (path_source, host_path),
+        "angle_of_attack": (
+            "host cand",
+            getattr(club_path, "candidate_attack_angle_deg", None)
+            if club_path is not None
+            else None,
+        ),
+        "spin_rate": ("OPS", shot.spin_rpm),
+        "spin_axis": ("host", shot.spin_axis_deg),
+    }
+
+
+def _onboard_flags(metric) -> str:
+    flags = [
+        name
+        for name, on in (
+            ("IMPLAUSIBLE", metric.implausible),
+            ("fallback", metric.fallback),
+            ("radial", metric.radial_only),
+        )
+        if on
+    ]
+    return f" [{','.join(flags)}]" if flags else ""
+
+
+def format_onboard_comparison(shot: Shot, onboard, measurement, club_path) -> str:
+    """Every firmware metric beside the OPS or host value it is compared with.
+
+    One row per metric: the onboard value with its confidence, MEASURED /
+    ESTIMATED label and any doubt flags, then the comparator and the
+    onboard-minus-comparator delta. Unusable onboard values print with their
+    flags but no delta, so an implausible number is never read as agreement.
+    """
+    comparators = _onboard_comparators(shot, measurement, club_path)
+    lines = [
+        f"[SERVER] IWR6843 onboard shot {onboard.shot_id} v{onboard.version}: {onboard.verdict}, "
+        f"impact {onboard.impact_source}, club {onboard.club_points} pts / "
+        f"ball {onboard.ball_points} pts"
+        + (f", quality {','.join(sorted(onboard.quality))}" if onboard.quality else "")
+    ]
+    for name, label, scale, unit, decimals in _ONBOARD_ROWS:
+        metric = onboard.metrics.get(name)
+        if metric is None:
+            continue
+        value = metric.value * scale if metric.value is not None else None
+        row = f"  {label:<13}{_fmt(value, unit, decimals):>10}"
+        if value is not None:
+            row += f"  conf {metric.confidence:.2f} {metric.label}{_onboard_flags(metric)}"
+        if name in comparators:
+            source, other = comparators[name]
+            row = f"{row:<52}| {source} {_fmt(other, unit, decimals)}"
+            if metric.usable and other is not None:
+                row += f"  Δ {value - other:+.{decimals}f}"
+        lines.append(row)
+    ops_smash = shot.smash_factor
+    smash_row = f"  {'smash':<13}{_fmt(onboard.smash, '', 2):>10}"
+    smash_row = f"{smash_row:<52}| OPS {_fmt(ops_smash, '', 2)}"
+    if onboard.smash is not None and ops_smash is not None:
+        smash_row += f"  Δ {onboard.smash - ops_smash:+.2f}"
+    lines.append(smash_row)
+    fit = onboard.impact_fit
+    if fit:
+        tracks = ", ".join(
+            f"{track} {info['why']}"
+            + (f" {info['speed_mps'] * MPS_TO_MPH:.1f} mph" if info.get("speed_mps") else "")
+            for track, info in fit.get("tracks", {}).items()
+        )
+        lines.append(
+            f"  {'impact fit':<13}{fit.get('verdict')}"
+            f", refined-trigger {_fmt(fit.get('refined_minus_trigger_us'), ' us', 0)}"
+            f", spread {_fmt(fit.get('spread_us'), ' us', 0)}"
+            + (f", dropped {fit['dropped']}" if fit.get("dropped") else "")
+            + (", no lock" if fit.get("no_lock") else "")
+            + (f"; {tracks}" if tracks else "")
+        )
+    return "\n".join(lines)
+
+
+def _log_onboard_comparison(shot: Shot, onboard, measurement, club_path) -> None:
+    """Print the firmware's numbers beside the OPS and host pipeline's, one block per shot."""
+    logger.info("%s", format_onboard_comparison(shot, onboard, measurement, club_path))
+
+
+def _launch_angle_withheld(metric) -> str | None:
+    """Why an onboard launch angle stays off the shot, or None when it goes on.
+
+    Stricter than Measurement.usable: a fallback means the configured tee
+    stood in for a locked ball, so the launch direction is a guess.
+    """
+    if metric.value is None:
+        return "missing"
+    if metric.implausible:
+        return "implausible"
+    if metric.fallback:
+        return "fallback"
+    return None
+
+
+def _onboard_tilt_correction_deg(shot: Shot) -> float:
+    """Effective minus configured IWR tilt for this shot, 0 without an applied snapshot.
+
+    The board measured with the configured tilt (BoardCalibration pitch), and
+    tilt adds to every elevation, so the difference adds to vertical launch
+    and angle of attack.
+    """
+    data = shot.inclinometer
+    if not data or not data.get("applied"):
+        return 0.0
+    effective = data.get("effective_iwr_tilt_deg")
+    configured = data.get("configured_iwr_tilt_deg")
+    if effective is None or configured is None:
+        return 0.0
+    return float(effective) - float(configured)
+
+
+def _apply_onboard_metrics(shot: Shot, onboard, *, azimuth_offset_deg: float) -> None:
+    """Put the firmware's launch angles and club delivery on the shot.
+
+    The board is the only IWR source on the shot. The host LCMF-v1 and club
+    path pipeline runs only on --debug readbacks and is logged beside the
+    board's numbers, never published, so a debug session shows what a kiosk
+    does. Ball speed stays the OPS measurement. Nothing from an invalid
+    verdict and nothing implausible is copied, nor a launch angle the board
+    measured from the fallback tee.
+
+    The board runs with azimuth offset 0 and the configured tilt, so the
+    aim offset is added to horizontal launch and club path, and the shot's
+    inclinometer correction to vertical launch and angle of attack.
+    """
+    if onboard.verdict == "invalid":
+        return
+    tilt_correction_deg = _onboard_tilt_correction_deg(shot)
+    vertical = onboard["vertical_launch"]
+    if _launch_angle_withheld(vertical) is None:
+        shot.launch_angle_vertical = vertical.value + tilt_correction_deg
+        shot.launch_angle_vertical_source = "radar"
+        shot.launch_angle_vertical_confidence = capped_angle_confidence(vertical.confidence)
+        shot.launch_angle_confidence = shot.launch_angle_vertical_confidence
+        shot.angle_source = "radar"
+    horizontal = onboard["horizontal_launch"]
+    if _launch_angle_withheld(horizontal) is None:
+        shot.iwr6843_horizontal_deg = horizontal.value + azimuth_offset_deg
+        shot.iwr6843_horizontal_confidence = capped_angle_confidence(horizontal.confidence)
+        shot.launch_angle_horizontal = shot.iwr6843_horizontal_deg
+        shot.launch_angle_horizontal_confidence = shot.iwr6843_horizontal_confidence
+        shot.launch_angle_horizontal_source = "radar"
+    path = onboard["club_path"]
+    if path.usable:
+        shot.experimental_club_path_deg = round(path.value + azimuth_offset_deg, 1)
+        shot.experimental_club_path_status = "onboard"
+    attack = onboard["angle_of_attack"]
+    if attack.usable:
+        shot.experimental_attack_angle_deg = round(attack.value + tilt_correction_deg, 1)
+        shot.experimental_attack_angle_status = "onboard"
+
+
+def _fill_club_speed_from_onboard(shot: Shot, onboard) -> None:
+    """The board's usable club speed when the OPS found no club peak.
+
+    Only a gap is filled: an OPS club speed is never replaced, and nothing
+    from an invalid verdict or an implausible value is used.
+    """
+    if shot.club_speed_mph is not None or onboard.verdict == "invalid":
+        return
+    club = onboard["club_speed"]
+    if not club.usable:
+        return
+    shot.club_speed_mph = club.value * MPS_TO_MPH
+    shot.club_speed_source = "iwr6843"
+    logger.info("[SERVER] IWR6843 club speed fills the OPS gap: %.1f mph", shot.club_speed_mph)
+
+
+def _emit_onboard_trigger_status(shot: Shot, onboard, capture) -> None:
+    """The trigger row's IWR state, from the board's result: the shot's only IWR source."""
+    if onboard is None:
+        if capture.valid:
+            # The board had no RESULT packet ready, but the --debug readback
+            # arrived and is saved: the capture did not fail, only the
+            # onboard metrics are missing.
+            _emit_iwr6843_trigger_status(
+                shot,
+                state="no_onboard",
+                reason=f"no onboard result; --debug readback #{capture.sequence} saved",
+            )
+            return
+        _emit_iwr6843_trigger_status(
+            shot, state="error", reason=capture.error or "no onboard result"
+        )
+        return
+    if onboard.verdict == "invalid":
+        _emit_iwr6843_trigger_status(shot, state="rejected", reason="onboard verdict invalid")
+        return
+    withheld = _launch_angle_withheld(onboard["vertical_launch"])
+    if withheld is not None:
+        _emit_iwr6843_trigger_status(shot, state="rejected", reason=f"vertical_launch {withheld}")
+        return
+    _emit_iwr6843_trigger_status(
+        shot, state="accepted", reason="accepted", angle_deg=shot.launch_angle_vertical
+    )
+
+
+def _log_host_readback(capture, measurement, club_path) -> None:
+    """What the host pipeline made of a --debug readback. Logged only, never on the shot."""
+    if capture.onboard_only:
+        return
+    if not capture.valid:
+        logger.warning(
+            "[SERVER] IWR6843 debug readback #%d failed: %s", capture.sequence, capture.error
+        )
+        return
+    if measurement is None:
+        logger.warning("[SERVER] IWR6843 debug readback had no LCMF measurement")
+    elif measurement.accepted:
+        horizontal_deg = getattr(measurement, "horizontal_deg", None)
+        if horizontal_deg is not None:
+            logger.info(
+                "[SERVER] IWR6843 host TX2 horizontal proxy: %.2f° (coherence %.0f%%, status=%s)",
+                horizontal_deg,
+                (getattr(measurement, "horizontal_confidence", None) or 0.0) * 100,
+                getattr(measurement, "horizontal_status", None),
+            )
+        logger.info(
+            "[SERVER] IWR6843 host LCMF-v1 launch: %.2f° "
+            "(%d snapshots/%d frames, component std %.2f°)",
+            measurement.angle_deg,
+            measurement.n_snapshots,
+            measurement.n_frames,
+            measurement.component_std_deg,
+        )
+    else:
+        logger.info("[SERVER] IWR6843 host LCMF-v1 withheld angle: %s", measurement.status)
+    if club_path is not None and club_path.accepted:
+        logger.info(
+            "[SERVER] IWR6843 host club path: %.2f° (confidence %.2f, %d frames)",
+            club_path.path_deg,
+            club_path.confidence or 0.0,
+            club_path.n_frames,
+        )
+
+
 def _process_iwr6843_angle(shot: Shot) -> float | None:
-    """Apply a correlated LCMF-v1 result without risking the OPS shot."""
+    """Apply the board's correlated shot result without risking the OPS shot.
+
+    Without --debug the capture is the board's result alone (no readback).
+    With it, the ring is also read back and run through the host pipeline,
+    which is logged beside the board's numbers but never published.
+    """
     if iwr6843_runtime is None or shot.mode == "mock":
         return None
 
@@ -3170,6 +3822,8 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
         club_path = getattr(shot_result, "club_path", None)
         if measurement is not None:
             shot.iwr6843_ball_range_evidence = getattr(measurement, "range_evidence", None)
+        if club_path is not None:
+            shot.iwr6843_club_range_evidence = getattr(club_path, "range_evidence", None)
         session_log = get_session_logger()
         if session_log:
             session_log.log_iwr6843_capture(
@@ -3192,6 +3846,7 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 ),
             )
 
+        _check_self_trigger_latency(shot, capture)
         if capture is None:
             logger.warning("[SERVER] IWR6843 capture timed out; preserving OPS shot")
             _emit_iwr6843_trigger_status(
@@ -3199,111 +3854,35 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 state="error",
                 reason="no capture matched the OPS impact timestamp",
             )
-        elif not capture.valid:
+            return (time.time() - started) * 1000.0
+
+        _log_host_readback(capture, measurement, club_path)
+        onboard = getattr(shot_result, "onboard", None)
+        if onboard is None:
             logger.warning(
-                "[SERVER] IWR6843 capture #%d failed: %s; preserving OPS shot",
+                "[SERVER] IWR6843 capture #%d carried no onboard result; preserving OPS shot",
                 capture.sequence,
-                capture.error,
-            )
-            _emit_iwr6843_trigger_status(
-                shot,
-                state="error",
-                reason=capture.error or "invalid IWR6843 capture",
-            )
-        elif measurement is None:
-            logger.warning("[SERVER] IWR6843 capture had no LCMF measurement")
-            _emit_iwr6843_trigger_status(
-                shot,
-                state="rejected",
-                reason="no LCMF measurement",
-            )
-        elif measurement.accepted:
-            shot.launch_angle_vertical = measurement.angle_deg
-            # Device-level provenance is retained in iwr6843_capture. The
-            # public Shot contract uses "radar" for all measured radar angles.
-            shot.launch_angle_vertical_source = "radar"
-            shot.launch_angle_vertical_confidence = vertical_confidence(measurement)
-            shot.launch_angle_confidence = shot.launch_angle_vertical_confidence
-            shot.angle_source = "radar"
-            horizontal_deg = getattr(measurement, "horizontal_deg", None)
-            horizontal_confidence = getattr(measurement, "horizontal_confidence", None)
-            horizontal_status = getattr(measurement, "horizontal_status", None)
-            if horizontal_deg is not None:
-                shot.iwr6843_horizontal_deg = horizontal_deg
-                shot.iwr6843_horizontal_confidence = horizontal_confidence_from(
-                    horizontal_confidence
-                )
-                shot.launch_angle_horizontal = horizontal_deg
-                shot.launch_angle_horizontal_confidence = shot.iwr6843_horizontal_confidence
-                shot.launch_angle_horizontal_source = "radar"
-                logger.info(
-                    "[SERVER] IWR6843 TX2 horizontal proxy: %.2f° (coherence %.0f%%, status=%s)",
-                    horizontal_deg,
-                    (horizontal_confidence or 0.0) * 100,
-                    horizontal_status,
-                )
-            logger.info(
-                "[SERVER] IWR6843 LCMF-v1 launch: %.2f° "
-                "(%d snapshots/%d frames, component std %.2f°)",
-                measurement.angle_deg,
-                measurement.n_snapshots,
-                measurement.n_frames,
-                measurement.component_std_deg,
-            )
-            _emit_iwr6843_trigger_status(
-                shot,
-                state="accepted",
-                reason="accepted",
-                angle_deg=measurement.angle_deg,
             )
         else:
-            logger.warning(
-                "[SERVER] IWR6843 LCMF-v1 withheld angle: %s",
-                measurement.status,
-            )
-            _emit_iwr6843_trigger_status(
-                shot,
-                state="rejected",
-                reason=measurement.status,
+            shot.iwr6843_onboard = onboard.to_dict()
+            _log_onboard_comparison(shot, onboard, measurement, club_path)
+            # The OPS stays the validator: its speeds and the IWR's, never
+            # averaged. Built before the club-speed fill, so a filled club
+            # speed is never checked against itself.
+            from .iwr6843.ops_compare import (  # pylint: disable=import-outside-toplevel
+                OpsComparison,
             )
 
-        # IWR club path/AoA remain experimental even when their internal
-        # quality gates accept them. Publish them through the normal UI path,
-        # but never populate the canonical club fields or silently label them
-        # as production radar measurements.
-        if club_path is not None:
-            shot.iwr6843_club_range_evidence = getattr(club_path, "range_evidence", None)
-            accepted_path = club_path.path_deg if club_path.accepted else None
-            candidate_path = (
-                accepted_path
-                if accepted_path is not None
-                else getattr(club_path, "candidate_path_deg", None)
+            shot.iwr6843_ops_check = OpsComparison.from_shot(
+                shot, onboard, capture_format=iwr6843_runtime_config.get("capture_format")
+            ).to_dict()
+            if session_log:
+                session_log.log_iwr_ops_comparison(shot.iwr6843_ops_check)
+            _apply_onboard_metrics(
+                shot, onboard, azimuth_offset_deg=iwr6843_runtime.azimuth_offset_deg
             )
-            candidate_attack = getattr(club_path, "candidate_attack_angle_deg", None)
-            candidate_path_status = getattr(club_path, "candidate_path_status", None)
-            shot.experimental_club_path_status = (
-                club_path.status
-                if accepted_path is not None
-                else (
-                    candidate_path_status
-                    if candidate_path_status not in (None, "candidate_available")
-                    else club_path.status
-                )
-            )
-            shot.experimental_attack_angle_status = (
-                getattr(club_path, "attack_angle_status", None) or club_path.status
-            )
-            if candidate_path is not None:
-                shot.experimental_club_path_deg = round(candidate_path, 1)
-            if candidate_attack is not None:
-                shot.experimental_attack_angle_deg = round(candidate_attack, 1)
-            if accepted_path is not None:
-                logger.info(
-                    "[SERVER] Experimental IWR6843 club path: %.2f° (confidence %.2f, %d frames)",
-                    accepted_path,
-                    club_path.confidence or 0.0,
-                    club_path.n_frames,
-                )
+            _fill_club_speed_from_onboard(shot, onboard)
+        _emit_onboard_trigger_status(shot, onboard, capture)
     except Exception as error:  # pylint: disable=broad-exception-caught
         logger.warning("[SERVER] IWR6843 processing error: %s", error, exc_info=True)
         log_session_error(
@@ -4008,16 +4587,31 @@ def _finalize_shot_detected(
     # back to the table estimator otherwise (either ballistics disabled or
     # angle missing → resolve_launch returns None). This is the only place
     # that writes carry_spin_adjusted for a live shot.
+    late_plan = _plan_late_window(shot)
+    if late_plan is not None:
+        shot.late_window = {**late_plan.to_dict(), "status": "pending"}
+        logger.info(
+            "[SERVER] Late window planned: apex %.2fs, looks at %.2fs and %.2fs",
+            late_plan.apex_t_s,
+            late_plan.looks[0].t_s,
+            late_plan.looks[-1].t_s,
+        )
+
     if shot.mode != "mock":
         conditions = resolve_launch(shot) if ballistics_enabled else None
         if conditions is not None:
-            trajectory = simulate(conditions)
+            trajectory = simulate(conditions, air_density=flight_environment.air_density_kg_m3)
             shot.carry_spin_adjusted = trajectory.carry_yards
+            # The late window, when it measures one, replaces this afterwards.
+            shot.landing_angle_deg = trajectory.landing_angle_deg
+            shot.landing_angle_source = "ballistic"
             logger.info(
-                "[SERVER] Ballistic carry: %.0f yds (spin: %.0f rpm, source: %s)",
+                "[SERVER] Ballistic carry: %.0f yds "
+                "(spin: %.0f rpm, source: %s, landing: %.1f deg)",
                 shot.carry_spin_adjusted,
                 conditions.spin_rpm,
                 conditions.spin_source,
+                shot.landing_angle_deg,
             )
         else:
             has_reliable_spin = (
@@ -4118,6 +4712,10 @@ def _finalize_shot_detected(
 
     # Forward to simulator connectors (optional)
     _forward_shot_to_simulators(shot)
+
+    # Seconds of radar time; runs on the IWR worker after the shot is out.
+    if late_plan is not None:
+        _start_late_window(shot, late_plan)
 
     # Debug logging (optional)
     if debug_mode:
@@ -4767,7 +5365,15 @@ def start_monitor(
             processing_callback=on_shot_processing,
         )
         if iwr6843_runtime is not None:
-            iwr6843_runtime.capture_monitor.arm()
+            capture_monitor = iwr6843_runtime.capture_monitor
+            if capture_monitor.watch_self_trigger:
+                ops_radar = getattr(monitor, "radar", None)
+                if ops_radar is None or not hasattr(ops_radar, "request_capture"):
+                    raise RuntimeError("IWR6843 self-trigger needs an OPS radar that accepts S!")
+                capture_monitor.add_trigger_observer(
+                    lambda _timestamp, radar=ops_radar: radar.request_capture()
+                )
+            capture_monitor.arm()
     else:
         monitor.start(  # pylint: disable=unexpected-keyword-arg
             shot_callback=on_shot_detected,
@@ -5228,6 +5834,68 @@ def _add_ballistics_arguments(parser):
         help="Disable the physics simulator and use the legacy carry table for all shots.",
     )
     parser.set_defaults(ballistics=True)
+    parser.add_argument(
+        "--temperature-c",
+        type=float,
+        default=STANDARD_ENVIRONMENT.temperature_c,
+        help="Air temperature for the flight model (default 15 C).",
+    )
+    parser.add_argument(
+        "--pressure-hpa",
+        type=float,
+        default=None,
+        help="Station pressure for the flight model (default: standard, or from --altitude-m).",
+    )
+    parser.add_argument(
+        "--humidity",
+        type=float,
+        default=0.0,
+        help="Relative humidity 0..1 for the flight model (default 0).",
+    )
+    parser.add_argument(
+        "--altitude-m",
+        type=float,
+        default=None,
+        help="Range altitude, used for the pressure when --pressure-hpa is not given.",
+    )
+
+
+def environment_from_args(args) -> Environment:
+    """The flight model's air from the CLI; standard pressure unless told otherwise."""
+    pressure = args.pressure_hpa
+    if pressure is None and args.altitude_m is None:
+        pressure = STANDARD_ENVIRONMENT.pressure_hpa
+    return Environment(
+        temperature_c=args.temperature_c,
+        pressure_hpa=pressure,
+        relative_humidity=args.humidity,
+        altitude_m=args.altitude_m,
+    )
+
+
+def _add_iwr6843_tee_band_argument(parser):
+    """Add the firmware tee band's total width (0: off)."""
+    from .iwr6843.monitor import TEE_BAND_DEFAULT_BINS  # pylint: disable=import-outside-toplevel
+
+    parser.add_argument(
+        "--iwr6843-tee-band-bins",
+        type=float,
+        default=TEE_BAND_DEFAULT_BINS,
+        help="Width in range bins of the tee band the club and ball trackers ignore, "
+        f"placed on the noisiest bins near the tee (default: {TEE_BAND_DEFAULT_BINS:g}; "
+        "0 = off; experimental)",
+    )
+
+
+def _add_iwr6843_ball_snr_argument(parser):
+    """Add the firmware ball tracker's snr, apart from the trigger's."""
+    parser.add_argument(
+        "--iwr6843-ball-snr",
+        type=float,
+        default=None,
+        help="Ball tracker's target threshold as a multiple of its noise floor, 1..1e6, "
+        "separate from --iwr6843-self-trigger-snr (default: the firmware's, 1)",
+    )
 
 
 def _add_battery_arguments(parser):
@@ -5254,7 +5922,14 @@ def _apply_kld7_device_defaults(args, dev_root: Path = Path("/dev")) -> None:
 
 def main():
     """Run the server."""
+    # Lazy: the iwr6843 package pulls in the estimator stack.
     import argparse  # pylint: disable=import-outside-toplevel
+
+    from .iwr6843.calibration import (  # pylint: disable=import-outside-toplevel
+        DEFAULT_TEE_RANGE_M,
+        MIN_TEE_RANGE_M,
+    )
+    from .iwr6843.monitor import DEFAULT_IWR6843_CONFIG  # pylint: disable=import-outside-toplevel
 
     parser = argparse.ArgumentParser(description="OpenFlight UI Server")
     parser.add_argument("--port", "-p", help="Serial port for radar")
@@ -5295,7 +5970,12 @@ def main():
         help="Write structured initialization progress for the optional kiosk splash",
     )
     parser.add_argument(
-        "--debug", "-d", action="store_true", help="Enable verbose FFT/CFAR debug output"
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable verbose FFT/CFAR debug output. With --iwr6843 also read the TI ring "
+        "back after every shot, save it and log the host LCMF-v1 numbers beside the "
+        "firmware's (the shot always carries the firmware's)",
     )
     parser.add_argument(
         "--radar-log", action="store_true", help="Log raw radar data to console (Python logging)"
@@ -5498,10 +6178,11 @@ def main():
     parser.add_argument(
         "--sound-pre-trigger",
         type=int,
-        default=16,
+        default=None,
         help=(
             "Pre-trigger segments S#n, 0-32 "
-            "(default: 16 = 50/50 split, each segment ~4.27ms at 30ksps)"
+            "(default: 16 = 50/50 split, 24 with --iwr6843-self-trigger; "
+            "each segment ~4.27ms at 30ksps)"
         ),
     )
     parser.add_argument(
@@ -5517,7 +6198,7 @@ def main():
     parser.add_argument(
         "--iwr6843",
         action="store_true",
-        help="Enable TI IWR6843 L3 capture and LCMF-v1 vertical launch angle",
+        help="Enable the TI IWR6843: launch angles and club delivery from its firmware",
     )
     parser.add_argument(
         "--inclinometer",
@@ -5548,13 +6229,87 @@ def main():
     )
     parser.add_argument(
         "--iwr6843-config",
-        default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg",
-        help="TI RF config matching the flashed L3 firmware",
+        default=DEFAULT_IWR6843_CONFIG,
+        help="TI RF config matching the flashed L3 firmware "
+        "(default: wide IQ16, 24 frames at 2 ms, Hann window; fall back with "
+        "--iwr6843-config config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg)",
     )
     parser.add_argument(
         "--iwr6843-cal",
-        default="config/iwr6843_calibration_reference.json",
-        help="TI complex array/range calibration JSON",
+        default=None,
+        help="TI complex array/range calibration JSON (default: this board's, "
+        "~/.config/openflight/iwr6843_calibration.json, when it has been measured; "
+        "else config/iwr6843_calibration_reference.json)",
+    )
+    parser.add_argument(
+        "--iwr6843-self-trigger",
+        action="store_true",
+        help="Freeze the IWR ring when the firmware club track is predicted to cross "
+        "the tee's range and send S! to the OPS, instead of the sound-gate edge. The "
+        "bin it watches is --iwr6843-self-trigger-bin",
+    )
+    parser.add_argument(
+        "--iwr6843-self-trigger-bin",
+        type=int,
+        default=None,
+        help="Global range-FFT bin the trigger watches, inside the cfg's first capture "
+        "window (default: two bins short of the ball, from --iwr6843-tee-m, moved by "
+        "--iwr6843-self-trigger-offset-m). Requires --iwr6843-self-trigger",
+    )
+    parser.add_argument(
+        "--iwr6843-self-trigger-offset-m",
+        type=float,
+        default=None,
+        help="Move the default trigger bin this far downrange, in whole bins; negative "
+        "moves it toward the radar (default: 0.2, so a swing's line must carry past the "
+        "ball, which backswings and waggles do not). The board's tee band, ball search "
+        "and retained cells move with it. Not with --iwr6843-self-trigger-bin. "
+        "Requires --iwr6843-self-trigger",
+    )
+    parser.add_argument(
+        "--iwr6843-self-trigger-snr",
+        type=float,
+        default=None,
+        help="Club target threshold as a multiple of the firmware's running "
+        "noise floor, at least 1 (default: 1). Requires --iwr6843-self-trigger",
+    )
+    parser.add_argument(
+        "--iwr6843-veto-no-ball",
+        action="store_true",
+        help="Skip the IWR readback when the firmware's shot result shows no ball flight "
+        "(raking a ball over, a waggle), and rearm at once. Off by default: the firmware's "
+        "ball tracker still misses real balls. Requires --iwr6843-self-trigger",
+    )
+    from .iwr6843.setup_poll import BALL_DETECTOR_MODES  # pylint: disable=import-outside-toplevel
+
+    parser.add_argument(
+        "--iwr6843-ball-detector",
+        choices=BALL_DETECTOR_MODES,
+        default="off",
+        help="Firmware ball-placement detector: on locks the ball for the onboard shot "
+        "machine and drives the kiosk setup banner; follow also aims the self-trigger at "
+        "the locked ball; off leaves the configured tee bin (default: off). The banner's "
+        "poll holds the radar's serial port about once a second, and a sound-trigger edge "
+        "that arrives meanwhile is dropped",
+    )
+    parser.add_argument(
+        "--iwr6843-setup-poll-s",
+        type=float,
+        default=1.0,
+        help="Seconds between ball status polls for the setup banner (default: 1.0)",
+    )
+    parser.add_argument(
+        "--iwr6843-full-capture",
+        action="store_true",
+        help="Transfer all IWR samples instead of selected cells, for diagnosis "
+        "(about 7 seconds per shot on the default profile). On by itself with --debug, "
+        "which it requires",
+    )
+    parser.add_argument(
+        "--no-iwr6843-onboard-track",
+        dest="iwr6843_onboard_track",
+        action="store_false",
+        help="Plan track cells on the Pi (l3sparse) even when the firmware can do it (l3track)",
     )
     parser.add_argument(
         "--iwr6843-trigger-pin",
@@ -5565,20 +6320,37 @@ def main():
     parser.add_argument(
         "--iwr6843-tee-m",
         type=float,
-        default=1.575,
-        help="Antenna-center to tee slant range in metres (default: 1.575)",
+        default=DEFAULT_TEE_RANGE_M,
+        help="Distance in metres from the enclosure front to the centre of the ball, not "
+        "the golfer's feet (horizontal is fine: the ball's height barely changes it). "
+        "The array's depth behind the front is added internally "
+        f"(default: {DEFAULT_TEE_RANGE_M}, minimum: {MIN_TEE_RANGE_M})",
     )
+    _add_iwr6843_tee_band_argument(parser)
+    _add_iwr6843_ball_snr_argument(parser)
     parser.add_argument(
         "--iwr6843-net-m",
         type=float,
         default=4.6,
-        help="Antenna-center to net range in metres (default: 4.6)",
+        help="Distance in metres from the enclosure front to the net or screen; the "
+        "array's depth behind the front is added internally. Only used when hitting "
+        "into a net (--iwr6843-flight net): ball tracks are kept 0.25 m short of it "
+        "(default: 4.6)",
     )
+    parser.add_argument(
+        "--iwr6843-flight",
+        choices=["net", "range", "course"],
+        default="net",
+        help="net clamps tracks at the net. range or course keeps returns past it "
+        "and records the late-window looks (default: net)",
+    )
+    from .iwr6843.calibration import DEFAULT_PITCH_DEG  # pylint: disable=import-outside-toplevel
+
     parser.add_argument(
         "--iwr6843-tilt-deg",
         type=float,
-        default=None,
-        help="Override mount tilt from the TI calibration JSON",
+        default=DEFAULT_PITCH_DEG,
+        help=f"Mount tilt in degrees (default: {DEFAULT_PITCH_DEG:g}; overrides the cal JSON)",
     )
     parser.add_argument(
         "--iwr6843-radar-height-m",
@@ -5777,8 +6549,43 @@ def main():
         parser.error("--camera-shot-analysis cannot be used with --mock")
     if args.camera_capture and args.mock:
         parser.error("--camera-capture cannot be used with --mock")
-    if args.iwr6843 and (args.iwr6843_tee_m <= 0 or args.iwr6843_net_m <= 0):
-        parser.error("--iwr6843-tee-m and --iwr6843-net-m must be positive")
+    # "not >=" also refuses NaN.
+    if args.iwr6843 and not args.iwr6843_tee_m >= MIN_TEE_RANGE_M:
+        parser.error(
+            f"--iwr6843-tee-m must be at least {MIN_TEE_RANGE_M:g} m, got {args.iwr6843_tee_m}"
+        )
+    if args.iwr6843 and args.iwr6843_net_m <= 0:
+        parser.error("--iwr6843-net-m must be positive")
+    if args.iwr6843:
+        from .iwr6843.monitor import TEE_BAND_MAX_BINS  # pylint: disable=import-outside-toplevel
+
+        # "not <=" also refuses NaN.
+        if not 0.0 <= args.iwr6843_tee_band_bins <= TEE_BAND_MAX_BINS:
+            parser.error(f"--iwr6843-tee-band-bins must be 0..{TEE_BAND_MAX_BINS:g}")
+        if args.iwr6843_ball_snr is not None:
+            from .iwr6843.self_trigger import (  # pylint: disable=import-outside-toplevel
+                check_ball_snr,
+            )
+
+            try:
+                check_ball_snr(args.iwr6843_ball_snr)
+            except ValueError as error:
+                parser.error(f"--iwr6843-ball-snr must be {str(error).split('must be ', 1)[1]}")
+    try:
+        self_trigger_config = _self_trigger_config(args) if args.iwr6843 else None
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if args.iwr6843_self_trigger and not args.iwr6843:
+        parser.error("--iwr6843-self-trigger requires --iwr6843")
+    if args.iwr6843_full_capture and not args.debug:
+        parser.error(
+            "--iwr6843-full-capture requires --debug: without it the ring is not read back "
+            "(--debug turns full capture on by itself)"
+        )
+    if args.iwr6843_veto_no_ball and not args.iwr6843_self_trigger:
+        parser.error("--iwr6843-veto-no-ball requires --iwr6843-self-trigger")
+    if self_trigger_config is not None and args.trigger != "sound":
+        parser.error("--iwr6843-self-trigger drives the OPS with S!; use --trigger sound")
     if args.camera_capture and (
         args.camera_capture_width <= 0
         or args.camera_capture_height <= 0
@@ -5821,6 +6628,10 @@ def main():
     global calculated_spin_enabled
     calculated_spin_enabled = args.calculated_spin
     ballistics_enabled = args.ballistics
+    global flight_environment
+    flight_environment = environment_from_args(args)
+    if flight_environment != STANDARD_ENVIRONMENT:
+        logger.info("[SERVER] Flight model air: %s", flight_environment.describe())
     battery_provider = args.battery
     profile_store = ProfileStore(args.profiles_path)
     startup_status = StartupStatusReporter(
@@ -5883,9 +6694,10 @@ def main():
         set_show_raw_readings(True)
         print("Raw radar readings display ENABLED - signed speed values will be shown")
 
-    # Start the monitor. Keep sound-only settings out of the other strategies.
+    # Start the monitor. Sound uses the IWR self-trigger settings; the other
+    # strategies must not inherit that pre-trigger split.
     if args.trigger == "sound":
-        trigger_kwargs = {"pre_trigger_segments": args.sound_pre_trigger}
+        trigger_kwargs = _ops_trigger_kwargs(args)
     elif args.trigger == "hardware":
         trigger_kwargs = {
             "trigger_threshold_mph": (
@@ -5958,14 +6770,18 @@ def main():
             )
             / "iwr6843"
         )
+        # Raw cloud uploads need the dumps on disk to send them. On this tree
+        # that is the debug readback: a full capture, saved.
+        iwr_debug = args.debug or _cloud_raw_uploads_enabled()
         if init_iwr6843(
             port=args.iwr6843_port,
             config_path=args.iwr6843_config,
-            calibration_path=args.iwr6843_cal,
+            calibration_path=_iwr6843_calibration_path(args),
             output_dir=iwr_output_dir,
             trigger_pin=args.iwr6843_trigger_pin,
             tee_range_m=args.iwr6843_tee_m,
             net_range_m=args.iwr6843_net_m,
+            flight=args.iwr6843_flight,
             tx_order=args.iwr6843_tx_order,
             capture_timeout_s=args.iwr6843_capture_timeout,
             tilt_deg=args.iwr6843_tilt_deg,
@@ -5973,19 +6789,26 @@ def main():
             ball_height_m=args.iwr6843_ball_height_m,
             azimuth_offset_deg=args.iwr6843_azimuth_offset_deg,
             horizontal_phase_reference_rad=args.iwr6843_horizontal_phase_reference_rad,
-            # Raw cloud uploads need the dumps on disk to send them.
-            save_dumps=args.debug or _cloud_raw_uploads_enabled(),
+            debug=iwr_debug,
+            self_trigger=self_trigger_config,
+            onboard_track=args.iwr6843_onboard_track,
+            full_capture=args.iwr6843_full_capture,
+            ball_detector=args.iwr6843_ball_detector,
+            setup_poll_s=args.iwr6843_setup_poll_s,
+            tee_band_bins=args.iwr6843_tee_band_bins,
+            ball_snr=args.iwr6843_ball_snr,
+            veto_no_ball=args.iwr6843_veto_no_ball,
         ):
             calibration = iwr6843_runtime.calibration
-            ball_speed_correction_distance_ft = args.iwr6843_tee_m * 3.28084
+            ball_speed_correction_distance_ft = _iwr6843_tee_range_m(args) * 3.28084
             ball_speed_correction_ball_above_radar_ft = (
                 calibration.tee_ball_height_m - calibration.radar_height_m
             ) * 3.28084
             print(
-                "IWR6843 enabled (LCMF-v1 launch angle, "
+                "IWR6843 enabled (onboard launch angles, "
                 f"BCM{args.iwr6843_trigger_pin}, {iwr6843_runtime.tx_order} TX order)"
             )
-            if args.debug:
+            if iwr_debug:
                 print(f"IWR6843 raw dumps enabled: {iwr_output_dir}")
             startup_status.ready("ti", "TI radar connected")
         else:
